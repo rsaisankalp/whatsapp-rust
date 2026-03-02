@@ -1983,151 +1983,223 @@ async fn perform_stun_allocate(
     relay_key: &[u8],
     ssrc: u32,
 ) -> Result<(), String> {
-    if env_bool("WHATSAPP_CALL_SKIP_STUN_ALLOCATE", true) {
-        debug!(
-            "Skipping STUN Allocate for {} (WHATSAPP_CALL_SKIP_STUN_ALLOCATE=true)",
-            call_id
-        );
-        return Ok(());
-    }
+    let relay_options = call_manager.get_relay_data(call_id).await;
+    let call_info = call_manager.get_call(call_id).await;
+    let sender_jid = call_info.as_ref().map(|c| c.call_creator.to_string());
+    let self_pid = relay_options.as_ref().and_then(|r| r.self_pid);
 
-    let transaction_id = generate_transaction_id();
-    let include_sender_subscriptions = env_bool("WHATSAPP_CALL_STUN_SENDER_SUBS", false);
-    let allocate_no_integrity = env_bool("WHATSAPP_CALL_STUN_ALLOCATE_NO_INTEGRITY", false);
-    let allocate_no_username = env_bool("WHATSAPP_CALL_STUN_ALLOCATE_NO_USERNAME", false);
-    let allocate_no_fingerprint = env_bool("WHATSAPP_CALL_STUN_ALLOCATE_NO_FINGERPRINT", false);
-    let sender_subscriptions = if include_sender_subscriptions {
-        if let Some(call_info) = call_manager.get_call(call_id).await {
-            let sender_jid = call_info.call_creator.to_string();
-            debug!(
-                "Using sender subscription JID {} for call {}",
-                sender_jid, call_id
-            );
-            create_audio_sender_subscriptions_with_jid(ssrc, sender_jid)
-        } else {
-            create_audio_sender_subscriptions(ssrc)
-        }
-    } else {
-        Vec::new()
-    };
+    // Build combined sender + receiver subscriptions
+    let combined_subs = create_combined_sender_subscriptions(ssrc, self_pid, sender_jid.clone());
+    let receiver_subs = create_combined_receiver_subscription();
 
-    let build_allocate = |tx_id: [u8; 12], realm: Option<&str>, nonce: Option<&[u8]>| {
-        let mut msg = StunMessage::allocate_request(tx_id);
-        if allocate_no_fingerprint {
-            msg = msg.with_fingerprint(false);
-        }
-        if !allocate_no_username {
-            msg = msg.with_username(auth_token);
-        }
-        if !allocate_no_integrity {
-            msg = msg.with_integrity_key(relay_key);
-        }
-        if include_sender_subscriptions {
-            msg = msg.with_sender_subscriptions(sender_subscriptions.clone());
-        }
-        if let Some(realm_value) = realm {
-            msg = msg.with_realm(realm_value.to_string());
-        }
-        if let Some(nonce_value) = nonce {
-            msg = msg.with_nonce(nonce_value.to_vec());
-        }
-        msg
-    };
-
-    let initial = build_allocate(transaction_id, None, None);
-    debug!(
-        "STUN Allocate options for {}: sender_subs={} no_username={} no_integrity={} no_fingerprint={}",
-        call_id, include_sender_subscriptions, allocate_no_username, allocate_no_integrity, allocate_no_fingerprint
+    info!(
+        "DC TURN Allocate for {}: ssrc=0x{:08x}, sender_subs={} bytes, receiver_subs={} bytes",
+        call_id, ssrc, combined_subs.len(), receiver_subs.len()
     );
-    call_manager
-        .send_via_webrtc(call_id, &initial.encode())
-        .await
-        .map_err(|e| format!("STUN Allocate send failed: {}", e))?;
 
-    let start = Instant::now();
-    let mut challenge_retried = false;
-    while start.elapsed() < Duration::from_millis(1500) {
-        match call_manager
-            .recv_from_webrtc_timeout(call_id, Duration::from_millis(250))
-            .await
-        {
-            Ok(data) => {
-                if data.len() < 2 {
-                    continue;
-                }
-                if let Ok(stun) = StunMessage::decode(&data) {
-                    if stun.is_ping() {
-                        let pong = StunMessage::whatsapp_pong(stun.transaction_id).encode();
-                        if let Err(e) = call_manager.send_via_webrtc(call_id, &pong).await {
-                            debug!(
-                                "Failed sending STUN pong for {} during allocate: {}",
-                                call_id, e
-                            );
-                        }
-                        continue;
-                    }
+    // Strategy A: TURN Allocate with subscriptions via DataChannel
+    {
+        let transaction_id = generate_transaction_id();
+        let mut msg = StunMessage::allocate_request(transaction_id)
+            .with_username(auth_token)
+            .with_integrity_key(relay_key)
+            .with_sender_subscriptions(combined_subs.clone())
+            .with_receiver_subscription(receiver_subs.clone());
 
-                    if matches!(stun.msg_type, StunMessageType::AllocateResponse) {
-                        info!("STUN Allocate successful for call {}", call_id);
-                        return Ok(());
-                    }
+        let msg_data = msg.encode();
+        info!(
+            "DC Allocate strategy A (full auth + subs): {} bytes, txn={:02x?}",
+            msg_data.len(), &transaction_id[..4]
+        );
 
-                    if stun.is_error() {
-                        let (code, reason) = stun.error_code().unwrap_or((0, "unknown"));
-                        debug!(
-                            "STUN Allocate error for {}: code={} reason={}",
-                            call_id, code, reason
+        if let Err(e) = call_manager.send_via_webrtc(call_id, &msg_data).await {
+            warn!("DC Allocate send failed: {}", e);
+        }
+
+        // Wait for response with generous timeout
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(3000) {
+            match call_manager
+                .recv_from_webrtc_timeout(call_id, Duration::from_millis(200))
+                .await
+            {
+                Ok(data) => {
+                    info!(
+                        "DC Allocate response for {}: {} bytes, first20={:02x?}",
+                        call_id, data.len(), &data[..data.len().min(20)]
+                    );
+
+                    if let Ok(stun) = StunMessage::decode(&data) {
+                        info!(
+                            "DC Allocate STUN response: type=0x{:04x}, txn={:02x?}, attrs={}",
+                            stun.msg_type as u16, &stun.transaction_id[..4], stun.attributes.len()
                         );
 
-                        if !challenge_retried
-                            && matches!(code, 401 | 438)
-                            && let (Some(realm), Some(nonce)) = (stun.realm(), stun.nonce())
-                        {
-                            let retry_tx = generate_transaction_id();
-                            let retry = build_allocate(retry_tx, Some(realm), Some(nonce));
-                            if let Err(e) =
-                                call_manager.send_via_webrtc(call_id, &retry.encode()).await
-                            {
-                                debug!(
-                                    "STUN Allocate challenge retry send failed for {}: {}",
-                                    call_id, e
-                                );
-                            } else {
-                                debug!(
-                                    "Sent STUN Allocate challenge retry for {} (code={})",
-                                    call_id, code
-                                );
-                                challenge_retried = true;
+                        for attr in &stun.attributes {
+                            info!("DC Allocate attr: {:?}", attr);
+                        }
+
+                        if stun.is_ping() {
+                            let pong = StunMessage::whatsapp_pong(stun.transaction_id).encode();
+                            let _ = call_manager.send_via_webrtc(call_id, &pong).await;
+                            continue;
+                        }
+
+                        if matches!(stun.msg_type, StunMessageType::AllocateResponse) {
+                            info!(
+                                "STUN Allocate SUCCESS for {} via DataChannel! mapped={:?}, relayed={:?}, lifetime={:?}",
+                                call_id, stun.mapped_address(), stun.relayed_address(), stun.lifetime()
+                            );
+                            return Ok(());
+                        }
+
+                        if stun.is_error() {
+                            let (code, reason) = stun.error_code().unwrap_or((0, "unknown"));
+                            info!("DC Allocate error for {}: code={}, reason='{}'", call_id, code, reason);
+
+                            if matches!(code, 401 | 438) {
+                                if let (Some(realm), Some(nonce)) = (stun.realm(), stun.nonce()) {
+                                    info!("DC Allocate 401 challenge: realm='{}', nonce={} bytes", realm, nonce.len());
+                                    let retry_tx = generate_transaction_id();
+                                    let retry = StunMessage::allocate_request(retry_tx)
+                                        .with_username(auth_token)
+                                        .with_integrity_key(relay_key)
+                                        .with_realm(realm)
+                                        .with_nonce(nonce.to_vec())
+                                        .with_sender_subscriptions(combined_subs.clone())
+                                        .with_receiver_subscription(receiver_subs.clone());
+                                    let _ = call_manager.send_via_webrtc(call_id, &retry.encode()).await;
+                                    info!("Sent DC Allocate challenge retry for {} (realm={}, nonce={} bytes)", call_id, realm, nonce.len());
+                                    continue;
+                                }
                             }
                         }
-                        continue;
-                    }
 
-                    if matches!(stun.msg_type, StunMessageType::WhatsAppPong) {
-                        debug!("Received STUN pong for {} during allocate wait", call_id);
-                        continue;
+                        if matches!(stun.msg_type, StunMessageType::WhatsAppPong) {
+                            continue;
+                        }
+                    } else {
+                        info!(
+                            "DC Allocate non-STUN response: {} bytes, first_byte=0x{:02x}",
+                            data.len(), data.first().copied().unwrap_or(0)
+                        );
                     }
                 }
-
-                let msg_type = ((data[0] as u16 & 0x3F) << 8) | (data[1] as u16);
-                debug!(
-                    "Ignoring non-allocate STUN/control response for {} (msg_type=0x{:04x}, {} bytes)",
-                    call_id,
-                    msg_type,
-                    data.len()
-                );
-            }
-            Err(e) => {
-                let err = e.to_string().to_lowercase();
-                if !err.contains("timeout") {
-                    debug!("STUN Allocate receive error for {}: {}", call_id, e);
+                Err(e) => {
+                    let err = e.to_string().to_lowercase();
+                    if !err.contains("timeout") {
+                        debug!("DC Allocate recv error: {}", e);
+                    }
                 }
             }
         }
+        info!("DC Allocate strategy A: no success after 3s");
+    }
+
+    // Strategy B: TURN Allocate without auth (minimal)
+    {
+        let transaction_id = generate_transaction_id();
+        let msg = StunMessage::allocate_request(transaction_id)
+            .with_sender_subscriptions(combined_subs.clone())
+            .with_receiver_subscription(receiver_subs.clone());
+
+        let msg_data = msg.encode();
+        info!(
+            "DC Allocate strategy B (no auth + subs): {} bytes, txn={:02x?}",
+            msg_data.len(), &transaction_id[..4]
+        );
+
+        if let Err(e) = call_manager.send_via_webrtc(call_id, &msg_data).await {
+            warn!("DC Allocate B send failed: {}", e);
+        }
+
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(2000) {
+            match call_manager
+                .recv_from_webrtc_timeout(call_id, Duration::from_millis(200))
+                .await
+            {
+                Ok(data) => {
+                    info!(
+                        "DC Allocate B response: {} bytes, first20={:02x?}",
+                        data.len(), &data[..data.len().min(20)]
+                    );
+                    if let Ok(stun) = StunMessage::decode(&data) {
+                        info!("DC Allocate B STUN: type=0x{:04x}", stun.msg_type as u16);
+                        for attr in &stun.attributes {
+                            info!("DC Allocate B attr: {:?}", attr);
+                        }
+                        if stun.is_ping() {
+                            let pong = StunMessage::whatsapp_pong(stun.transaction_id).encode();
+                            let _ = call_manager.send_via_webrtc(call_id, &pong).await;
+                            continue;
+                        }
+                        if matches!(stun.msg_type, StunMessageType::AllocateResponse) {
+                            info!("STUN Allocate B SUCCESS for {}!", call_id);
+                            return Ok(());
+                        }
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        info!("DC Allocate strategy B: no success after 2s");
+    }
+
+    // Strategy C: STUN Binding Request with subscriptions via DataChannel
+    {
+        let transaction_id = generate_transaction_id();
+        let msg = StunMessage::binding_request(transaction_id)
+            .with_username(auth_token)
+            .with_integrity_key(relay_key)
+            .with_sender_subscriptions(combined_subs.clone())
+            .with_receiver_subscription(receiver_subs.clone());
+
+        let msg_data = msg.encode();
+        info!(
+            "DC Bind strategy C (full auth + subs): {} bytes, txn={:02x?}",
+            msg_data.len(), &transaction_id[..4]
+        );
+
+        if let Err(e) = call_manager.send_via_webrtc(call_id, &msg_data).await {
+            warn!("DC Bind C send failed: {}", e);
+        }
+
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(2000) {
+            match call_manager
+                .recv_from_webrtc_timeout(call_id, Duration::from_millis(200))
+                .await
+            {
+                Ok(data) => {
+                    info!(
+                        "DC Bind C response: {} bytes, first20={:02x?}",
+                        data.len(), &data[..data.len().min(20)]
+                    );
+                    if let Ok(stun) = StunMessage::decode(&data) {
+                        info!("DC Bind C STUN: type=0x{:04x}", stun.msg_type as u16);
+                        for attr in &stun.attributes {
+                            info!("DC Bind C attr: {:?}", attr);
+                        }
+                        if stun.is_ping() {
+                            let pong = StunMessage::whatsapp_pong(stun.transaction_id).encode();
+                            let _ = call_manager.send_via_webrtc(call_id, &pong).await;
+                            continue;
+                        }
+                        if stun.is_success() {
+                            info!("DC Bind C SUCCESS for {}!", call_id);
+                            return Ok(());
+                        }
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        info!("DC Bind strategy C: no success after 2s");
     }
 
     warn!(
-        "STUN Allocate timeout for {}. Continuing (relay may already be bound).",
+        "DC TURN Allocate: all strategies timed out for {}. Continuing anyway.",
         call_id
     );
     Ok(())
