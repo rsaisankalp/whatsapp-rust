@@ -1154,6 +1154,17 @@ async fn start_call_automation(
         let (auth_token, relay_key) =
             extract_relay_credentials(&call_manager, &call_id, &relay_data).await?;
 
+        // Get the derived call keys (includes warp_auth for TURN Allocate)
+        let warp_auth = call_manager
+            .get_derived_keys(&call_id)
+            .await
+            .map(|keys| keys.warp_auth.to_vec());
+        if let Some(ref wa) = warp_auth {
+            info!("Got warp_auth key for {}: {} bytes", call_id, wa.len());
+        } else {
+            warn!("No warp_auth key available for {} (no encryption key set)", call_id);
+        }
+
         start_media_automation_session(
             client,
             call_manager,
@@ -1161,6 +1172,7 @@ async fn start_call_automation(
             hbh_key,
             auth_token,
             relay_key,
+            warp_auth,
             config,
         )
         .await
@@ -1267,6 +1279,7 @@ async fn start_media_automation_session(
     hbh_key: Vec<u8>,
     auth_token: Vec<u8>,
     relay_key: Vec<u8>,
+    warp_auth: Option<Vec<u8>>,
     config: CallAutomationConfig,
 ) -> Result<CallAutomationSession, String> {
     let call_id_string = call_id.to_string();
@@ -1291,11 +1304,19 @@ async fn start_media_automation_session(
     // pre-ICE bind phase (in webrtc.rs, before UDPMux takes over).
     // These post-connect strategies are secondary fallbacks.
 
-    if env_bool("WHATSAPP_CALL_STUN_ALLOCATE", false) {
-        perform_stun_allocate(&call_manager, &call_id, &auth_token, &relay_key, ssrc).await?;
+    if env_bool("WHATSAPP_CALL_STUN_ALLOCATE", true) {
+        perform_stun_allocate(
+            &call_manager,
+            &call_id,
+            &auth_token,
+            &relay_key,
+            warp_auth.as_deref(),
+            ssrc,
+        )
+        .await?;
     } else {
         info!(
-            "Skipping STUN Allocate for {} (WHATSAPP_CALL_STUN_ALLOCATE=false, research shows WASP relay doesn't need it)",
+            "Skipping STUN Allocate for {} (WHATSAPP_CALL_STUN_ALLOCATE=false)",
             call_id_string
         );
     }
@@ -1455,7 +1476,9 @@ async fn start_media_automation_session(
                 }
             };
 
-            let use_dc_media = env_bool("WHATSAPP_CALL_DC_MEDIA", false);
+            // Research: WhatsApp Web sends SRTP through DataChannel (SCTP/DTLS),
+            // not raw UDP. The relay extracts SRTP from DC messages and forwards.
+            let use_dc_media = env_bool("WHATSAPP_CALL_DC_MEDIA", true);
 
             // Send via raw UDP to relay (bypassing DTLS/SCTP)
             if use_raw_media {
@@ -2050,6 +2073,7 @@ async fn perform_stun_allocate(
     call_id: &CallId,
     auth_token: &[u8],
     relay_key: &[u8],
+    warp_auth: Option<&[u8]>,
     ssrc: u32,
 ) -> Result<(), String> {
     let relay_options = call_manager.get_relay_data(call_id).await;
@@ -2062,8 +2086,10 @@ async fn perform_stun_allocate(
     let receiver_subs = create_combined_receiver_subscription();
 
     info!(
-        "DC TURN Allocate for {}: ssrc=0x{:08x}, sender_subs={} bytes, receiver_subs={} bytes",
-        call_id, ssrc, combined_subs.len(), receiver_subs.len()
+        "DC TURN Allocate for {}: ssrc=0x{:08x}, warp_auth={}, sender_subs={} B, receiver_subs={} B",
+        call_id, ssrc,
+        warp_auth.map(|k| format!("{} bytes", k.len())).unwrap_or_else(|| "NONE".to_string()),
+        combined_subs.len(), receiver_subs.len()
     );
 
     // Helper: send a STUN message via DC and wait for a matching response
@@ -2123,44 +2149,45 @@ async fn perform_stun_allocate(
         }
     };
 
-    // The DC STUN parser:
-    // - 28-byte bare Allocate (REQUESTED-TRANSPORT only): 451 "Hmac missing" (parsed OK!)
-    // - With USERNAME + MESSAGE-INTEGRITY: 456 "Failed to decode" (can't parse)
-    // - With 0x4000/0x4001 subscription attrs: 456 "Failed to decode"
+    // DC STUN Parser facts (from previous experiments):
+    // - Can parse: REQUESTED-TRANSPORT + MESSAGE-INTEGRITY (no USERNAME)
+    // - Cannot parse: anything with USERNAME, 0x4000/0x4001, or ICE PRIORITY
+    // - Error 450 = parsed OK, wrong HMAC key
+    // - Error 451 = parsed OK, needs auth
+    // - Error 456 = parser failure
     //
-    // Try: MESSAGE-INTEGRITY without USERNAME (DC is DTLS-authenticated),
-    // different HMAC key formats, and attribute ordering.
+    // Key discovery: WARP auth key (HKDF label "warp auth key") from DerivedCallKeys
+    // is likely the correct HMAC key. It's 32 bytes derived from the call master key.
 
     let mut allocate_success = false;
     let engine = base64::engine::general_purpose::STANDARD;
 
-    // IMPORTANT: auth_token and relay_key are base64-ENCODED strings (96B and 24B).
-    // We need to also try the base64-DECODED raw binary forms.
+    // Build key candidates - warp_auth FIRST (most likely correct)
+    let mut keys_to_try: Vec<(&str, Vec<u8>)> = Vec::new();
+
+    // Priority 1: warp_auth (HKDF-derived "warp auth key", 32 bytes)
+    if let Some(wa) = warp_auth {
+        keys_to_try.push(("warp_auth_32", wa.to_vec()));
+        // Also try first 20 bytes (HMAC-SHA1 key is typically 20 bytes)
+        keys_to_try.push(("warp_auth_20", wa[..20.min(wa.len())].to_vec()));
+        // Also try first 16 bytes
+        keys_to_try.push(("warp_auth_16", wa[..16.min(wa.len())].to_vec()));
+    }
+
+    // Priority 2: Previously tried keys (all gave 450 "mismatch")
     let relay_key_decoded = engine.decode(relay_key).unwrap_or_default();
-    let auth_token_decoded = engine.decode(auth_token).unwrap_or_default();
     let hbh_key = relay_options.as_ref().and_then(|r| r.hbh_key.as_ref());
 
-    info!(
-        "Key sizes: auth_token_b64={}, auth_token_raw={}, relay_key_b64={}, relay_key_raw={}, hbh_key={}",
-        auth_token.len(), auth_token_decoded.len(),
-        relay_key.len(), relay_key_decoded.len(),
-        hbh_key.map(|k| k.len()).unwrap_or(0)
-    );
-
-    // Build key candidates: both base64 text AND raw decoded binary forms
-    let mut keys_to_try: Vec<(&str, Vec<u8>)> = vec![
-        ("relay_key_decoded_16", relay_key_decoded.clone()),       // 16 bytes raw
-        ("relay_key_b64_24", relay_key.to_vec()),                   // 24 bytes b64 text
-        ("auth_token_decoded_70", auth_token_decoded.clone()),     // 70 bytes raw
-        ("auth_token_b64_96", auth_token.to_vec()),                 // 96 bytes b64 text
-    ];
+    keys_to_try.push(("relay_key_raw_16", relay_key_decoded.clone()));
     if let Some(hbh) = hbh_key {
         keys_to_try.push(("hbh_key_30", hbh.to_vec()));
-        keys_to_try.push(("hbh_master_16", hbh[..16.min(hbh.len())].to_vec()));
-        // Also try base64 of hbh_key
-        let hbh_b64 = engine.encode(hbh);
-        keys_to_try.push(("hbh_b64", hbh_b64.into_bytes()));
     }
+
+    info!(
+        "Trying {} HMAC key candidates for DC TURN Allocate (warp_auth={})",
+        keys_to_try.len(),
+        warp_auth.is_some()
+    );
 
     for (key_name, key_data) in &keys_to_try {
         if allocate_success { break; }
@@ -2173,28 +2200,38 @@ async fn perform_stun_allocate(
         info!("Alloc key={} ({} B): msg {} B", key_name, key_data.len(), msg_data.len());
         if let Some(stun) = dc_send_and_recv(
             call_manager.clone(), call_id.clone(), msg_data,
-            format!("K-{}", key_name), 800,
+            format!("K-{}", key_name), 1500,
         ).await {
             if matches!(stun.msg_type, StunMessageType::AllocateResponse) {
-                info!("ALLOCATE SUCCESS with key={}!", key_name);
+                info!("*** ALLOCATE SUCCESS with key={} ***", key_name);
                 allocate_success = true;
             } else if stun.is_error() {
                 let (c, r) = stun.error_code().unwrap_or((0, "?"));
-                info!("{} → {}='{}'", key_name, c, r);
+                info!("{} → error {}='{}'", key_name, c, r);
+                // 450=wrong key, 451=needs auth, 456=parse failure
+                if c == 450 {
+                    info!("Key {} was parsed but HMAC mismatch (wrong key)", key_name);
+                }
             }
         }
     }
 
     if allocate_success {
-        info!("Allocate succeeded for {}!", call_id);
+        info!("*** TURN Allocate SUCCEEDED for {} - relay should now forward media ***", call_id);
     } else {
-        warn!("DC TURN Allocate: all strategies failed for {}. Continuing anyway.", call_id);
+        warn!(
+            "DC TURN Allocate: all {} keys failed for {}. Audio will likely not work.",
+            keys_to_try.len(), call_id
+        );
     }
 
-    // Always send raw protobuf subscriptions on DC (in case relay auto-routes)
+    // Also send raw protobuf subscriptions on DC
     let _ = call_manager.send_via_webrtc(call_id, &combined_subs).await;
     let _ = call_manager.send_via_webrtc(call_id, &receiver_subs).await;
-    info!("Sent raw protobuf subscriptions on DC (sender={} bytes, receiver={} bytes)", combined_subs.len(), receiver_subs.len());
+    info!(
+        "Sent protobuf subscriptions on DC (sender={} B, receiver={} B)",
+        combined_subs.len(), receiver_subs.len()
+    );
     Ok(())
 }
 
