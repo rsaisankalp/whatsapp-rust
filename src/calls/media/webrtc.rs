@@ -511,6 +511,98 @@ impl WebRtcTransport {
             }
         }
 
+        // PRE-ICE: Send authenticated STUN Bind with subscription attributes.
+        // This registers sender/receiver subscriptions with the relay BEFORE
+        // the ICE agent takes over. After ICE, the relay ignores late bind attempts.
+        let do_pre_ice_bind = env_bool("WHATSAPP_CALL_PRE_ICE_BIND", true);
+        let do_pre_ice_allocate = env_bool("WHATSAPP_CALL_PRE_ICE_ALLOCATE", false);
+
+        if do_pre_ice_bind || do_pre_ice_allocate {
+            use super::sender_subscriptions::{
+                create_combined_receiver_subscription,
+                create_combined_sender_subscriptions,
+            };
+
+            // Build subscription data (no SSRC needed when disable_ssrc_subscription=true)
+            let sender_subs = create_combined_sender_subscriptions(0, None, None);
+            let receiver_subs = create_combined_receiver_subscription();
+
+            info!(
+                "Pre-ICE subscription registration for relay {} (bind={}, allocate={}, sender={} bytes, receiver={} bytes)",
+                relay_info.relay_name,
+                do_pre_ice_bind,
+                do_pre_ice_allocate,
+                sender_subs.len(),
+                receiver_subs.len(),
+            );
+
+            if do_pre_ice_bind {
+                match relay_conn
+                    .pre_ice_bind_with_subscriptions(
+                        relay_info.auth_token.as_bytes(),
+                        relay_info.relay_key.as_bytes(),
+                        &sender_subs,
+                        &receiver_subs,
+                    )
+                    .await
+                {
+                    Ok(result) => {
+                        if result.success {
+                            info!(
+                                "Pre-ICE STUN Bind with subscriptions SUCCEEDED for {} (mapped={:?})",
+                                relay_info.relay_name, result.mapped_address
+                            );
+                        } else {
+                            warn!(
+                                "Pre-ICE STUN Bind with subscriptions FAILED for {} (response={} bytes)",
+                                relay_info.relay_name,
+                                result.response_bytes.len()
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Pre-ICE STUN Bind error for {}: {}",
+                            relay_info.relay_name, e
+                        );
+                    }
+                }
+            }
+
+            if do_pre_ice_allocate {
+                match relay_conn
+                    .pre_ice_allocate_with_subscriptions(
+                        relay_info.auth_token.as_bytes(),
+                        relay_info.relay_key.as_bytes(),
+                        &sender_subs,
+                        &receiver_subs,
+                    )
+                    .await
+                {
+                    Ok(result) => {
+                        if result.success {
+                            info!(
+                                "Pre-ICE TURN Allocate with subscriptions SUCCEEDED for {} (mapped={:?})",
+                                relay_info.relay_name, result.mapped_address
+                            );
+                        } else {
+                            warn!(
+                                "Pre-ICE TURN Allocate with subscriptions FAILED for {} (response={} bytes)",
+                                relay_info.relay_name,
+                                result.response_bytes.len()
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Pre-ICE TURN Allocate error for {}: {}",
+                            relay_info.relay_name, e
+                        );
+                    }
+                }
+            }
+        }
+
         // Save shared socket reference BEFORE UDPMux takes ownership
         let shared_socket = relay_conn.socket_arc();
         let shared_relay_addr = relay_conn.remote_addr();

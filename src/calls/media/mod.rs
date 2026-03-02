@@ -51,7 +51,7 @@ mod stun;
 mod transport;
 mod webrtc;
 
-pub use ice_interceptor::RelayUdpConn;
+pub use ice_interceptor::{PreIceBindResult, RelayUdpConn};
 pub use jitter::{JitterBuffer, JitterBufferConfig, JitterStats};
 pub use relay::{ConnectedRelay, RelayConnection, RelayConnectionConfig, RelayError, RelayState};
 pub use rtcp::{

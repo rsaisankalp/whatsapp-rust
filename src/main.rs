@@ -1281,6 +1281,16 @@ async fn start_media_automation_session(
     }
 
     let ssrc = rand::random::<u32>();
+
+    // Post-connect subscription registration strategies:
+    // 1. STUN Allocate via DC (legacy, usually disabled)
+    // 2. STUN Bind with subs on shared socket (slow, often fails after ICE)
+    // 3. Raw protobuf subscription via DataChannel (experimental)
+    //
+    // Note: The PRIMARY subscription registration now happens in the
+    // pre-ICE bind phase (in webrtc.rs, before UDPMux takes over).
+    // These post-connect strategies are secondary fallbacks.
+
     if env_bool("WHATSAPP_CALL_STUN_ALLOCATE", false) {
         perform_stun_allocate(&call_manager, &call_id, &auth_token, &relay_key, ssrc).await?;
     } else {
@@ -1288,16 +1298,52 @@ async fn start_media_automation_session(
             "Skipping explicit STUN Allocate for {} (WHATSAPP_CALL_STUN_ALLOCATE=false)",
             call_id_string
         );
-        if env_bool("WHATSAPP_CALL_STUN_BIND_SUBS", true) {
-            perform_stun_bind_with_subscriptions(
-                &call_manager,
-                &call_id,
-                &auth_token,
-                &relay_key,
-                ssrc,
-            )
-            .await?;
+    }
+
+    // Post-connect STUN Bind with subs (disabled by default - pre-ICE bind handles this)
+    if env_bool("WHATSAPP_CALL_STUN_BIND_SUBS", false) {
+        perform_stun_bind_with_subscriptions(
+            &call_manager,
+            &call_id,
+            &auth_token,
+            &relay_key,
+            ssrc,
+        )
+        .await?;
+    }
+
+    // Experimental: Send raw protobuf subscription via DataChannel
+    // This sends the subscription protobuf directly as a DC message
+    if env_bool("WHATSAPP_CALL_DC_PROTO_SUBS", true) {
+        let relay_options = call_manager.get_relay_data(&call_id).await;
+        let call_info = call_manager.get_call(&call_id).await;
+        let sender_jid = call_info.as_ref().map(|c| c.call_creator.to_string());
+        let self_pid = relay_options.as_ref().and_then(|r| r.self_pid);
+
+        let combined_subs = create_combined_sender_subscriptions(ssrc, self_pid, sender_jid.clone());
+        let receiver_subs = create_combined_receiver_subscription();
+
+        info!(
+            "Sending protobuf subscriptions via DataChannel for {} (sender={} bytes, receiver={} bytes, ssrc=0x{:08x})",
+            call_id_string, combined_subs.len(), receiver_subs.len(), ssrc
+        );
+
+        // Send sender subscriptions
+        if let Err(e) = call_manager.send_via_webrtc(&call_id, &combined_subs).await {
+            warn!("DC sender subscription send failed for {}: {}", call_id_string, e);
+        } else {
+            info!("Sent sender subscription via DC for {} ({} bytes)", call_id_string, combined_subs.len());
         }
+
+        // Send receiver subscriptions
+        if let Err(e) = call_manager.send_via_webrtc(&call_id, &receiver_subs).await {
+            warn!("DC receiver subscription send failed for {}: {}", call_id_string, e);
+        } else {
+            info!("Sent receiver subscription via DC for {} ({} bytes)", call_id_string, receiver_subs.len());
+        }
+
+        // Brief wait for relay to process
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
     let mut master_key = [0u8; 16];
