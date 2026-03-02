@@ -399,6 +399,24 @@ impl CallManager {
         Ok(builder.build())
     }
 
+    /// Send OFFER_NOTICE before OFFER to wake recipient devices.
+    pub async fn send_offer_notice(&self, call_id: &CallId) -> Result<Node, CallError> {
+        let calls = self.calls.read().await;
+        let info = calls
+            .get(call_id.as_str())
+            .ok_or_else(|| CallError::NotFound(call_id.to_string()))?;
+
+        let builder = CallStanzaBuilder::new(
+            call_id.as_str(),
+            info.call_creator.clone(),
+            info.peer_jid.clone(),
+            SignalingType::OfferNotice,
+        )
+        .stanza_id(call_id.as_str());
+
+        Ok(builder.build())
+    }
+
     /// Send relay latency measurements to the caller.
     pub async fn send_relay_latency(
         &self,
@@ -924,6 +942,19 @@ impl CallManager {
 
         info.set_encryption_key(key);
         log::debug!("Stored encryption key for call {}", call_id);
+        Ok(())
+    }
+
+    /// Override call creator JID for an existing call.
+    ///
+    /// Useful when routing requires PN vs LID identity selection per call.
+    pub async fn set_call_creator(&self, call_id: &CallId, call_creator: Jid) -> Result<(), CallError> {
+        let mut calls = self.calls.write().await;
+        let info = calls
+            .get_mut(call_id.as_str())
+            .ok_or_else(|| CallError::NotFound(call_id.to_string()))?;
+
+        info.call_creator = call_creator;
         Ok(())
     }
 

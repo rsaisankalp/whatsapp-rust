@@ -96,6 +96,7 @@ hkdf = { workspace = true }
 hmac = "0.12.1"
 log = { workspace = true }
 moka = { version = "0.12.12", features = ["future"] }
+opus = "0.3"
 prost = { workspace = true }
 rand = { workspace = true }
 rand_core = { workspace = true }

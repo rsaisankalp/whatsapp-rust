@@ -337,7 +337,7 @@ async fn handle_account_sync_devices(client: &Arc<Client>, node: &Node, devices_
 ///   </tokens>
 /// </notification>
 /// ```
-async fn handle_privacy_token_notification(_client: &Arc<Client>, node: &Node) {
+async fn handle_privacy_token_notification(client: &Arc<Client>, node: &Node) {
     let from = node.attrs().optional_string("from").unwrap_or("<unknown>");
 
     let Some(tokens_node) = node.get_optional_child_by_tag(&["tokens"]) else {
@@ -367,23 +367,50 @@ async fn handle_privacy_token_notification(_client: &Arc<Client>, node: &Node) {
 
         match token_type {
             "trusted_contact" => {
-                let token_len = token_node
-                    .content
-                    .as_ref()
-                    .map(|c| match c {
-                        wacore_binary::node::NodeContent::Bytes(b) => b.len(),
-                        _ => 0,
-                    })
-                    .unwrap_or(0);
+                let token_bytes = match token_node.content.as_ref() {
+                    Some(wacore_binary::node::NodeContent::Bytes(b)) => Some(b.clone()),
+                    Some(wacore_binary::node::NodeContent::String(s)) => {
+                        use base64::Engine as _;
+                        base64::engine::general_purpose::STANDARD
+                            .decode(s)
+                            .ok()
+                            .or_else(|| Some(s.as_bytes().to_vec()))
+                    }
+                    _ => None,
+                };
+
+                let Some(token_bytes) = token_bytes else {
+                    debug!(
+                        target: "Client/PrivacyToken",
+                        "trusted_contact token from {} had no usable payload",
+                        from
+                    );
+                    continue;
+                };
+
+                let from_jid: Jid = match from.parse() {
+                    Ok(j) => j,
+                    Err(e) => {
+                        warn!(
+                            target: "Client/PrivacyToken",
+                            "Failed parsing privacy token sender JID '{}': {}",
+                            from, e
+                        );
+                        continue;
+                    }
+                };
+
+                client
+                    .store_trusted_contact_token(&from_jid, token_bytes.clone())
+                    .await;
 
                 debug!(
                     target: "Client/PrivacyToken",
                     "Received trusted_contact token from {} ({} bytes, ts={})",
-                    from, token_len, timestamp
+                    from,
+                    token_bytes.len(),
+                    timestamp
                 );
-                // TODO: Store tcToken in per-contact storage for use in:
-                // - Profile picture IQ requests (when profile_scraping_privacy_token_in_photo_iq is enabled)
-                // - Call privacy elements (passed to WASM/native VOIP stack)
             }
             _ => {
                 debug!(

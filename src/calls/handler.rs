@@ -79,6 +79,8 @@ impl StanzaHandler for CallHandler {
                     "Received preaccept for call {} (peer is preparing to answer)",
                     parsed.call_id
                 );
+                self.maybe_setup_outgoing_media_on_preaccept(&client, &parsed)
+                    .await;
             }
             SignalingType::Mute => {
                 debug!("Received mute state change for call {}", parsed.call_id);
@@ -476,5 +478,117 @@ impl CallHandler {
         call_manager
             .notify_enc_rekey(&parsed.call_id, &derived_keys)
             .await;
+    }
+
+    async fn maybe_setup_outgoing_media_on_preaccept(&self, client: &Client, parsed: &ParsedCallStanza) {
+        let defer_outgoing_setup = std::env::var("WHATSAPP_CALL_DEFER_OUTGOING_SETUP")
+            .ok()
+            .map(|v| {
+                let normalized = v.trim().to_ascii_lowercase();
+                matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+            })
+            .unwrap_or(true);
+        if !defer_outgoing_setup {
+            return;
+        }
+
+        let call_manager = client.get_call_manager().await;
+        let call_id = CallId::new(&parsed.call_id);
+
+        if call_manager.get_webrtc_transport(&call_id).await.is_some() {
+            debug!(
+                "Skipping preaccept media setup for {}: WebRTC transport already exists",
+                parsed.call_id
+            );
+            return;
+        }
+
+        let Some(relay_data) = call_manager.get_relay_data(&call_id).await else {
+            debug!(
+                "Skipping preaccept media setup for {}: relay data not available yet",
+                parsed.call_id
+            );
+            return;
+        };
+
+        info!(
+            "Preaccept received for {}: starting deferred outgoing relaylatency/transport/WebRTC setup",
+            parsed.call_id
+        );
+
+        for endpoint in &relay_data.endpoints {
+            let token = relay_data
+                .relay_tokens
+                .get(endpoint.token_id as usize)
+                .cloned()
+                .unwrap_or_default();
+
+            let (ipv4, port) = endpoint
+                .addresses
+                .iter()
+                .find_map(|addr| addr.ipv4.as_ref().map(|ip| (Some(ip.clone()), addr.port)))
+                .unwrap_or((None, 3478));
+
+            let latency_ms = endpoint.c2r_rtt_ms.unwrap_or(50);
+            let measurement = RelayLatencyMeasurement {
+                relay_name: endpoint.relay_name.clone(),
+                latency_ms,
+                ipv4,
+                port,
+                token,
+            };
+
+            match call_manager.send_relay_latency(&call_id, vec![measurement]).await {
+                Ok(stanza) => {
+                    if let Err(e) = client.send_node(stanza).await {
+                        warn!(
+                            "Failed to send preaccept relay latency for {} in {}: {}",
+                            endpoint.relay_name, parsed.call_id, e
+                        );
+                    }
+                }
+                Err(e) => warn!(
+                    "Failed to build preaccept relay latency for {} in {}: {}",
+                    endpoint.relay_name, parsed.call_id, e
+                ),
+            }
+        }
+
+        let transport_params = TransportParams {
+            p2p_cand_round: Some(0),
+            transport_message_type: Some(0),
+            net_protocol: 0,
+            net_medium: 2,
+        };
+        match call_manager.send_transport(&call_id, transport_params).await {
+            Ok(transport_node) => {
+                if let Err(e) = client.send_node(transport_node).await {
+                    warn!("Failed to send preaccept transport for {}: {}", parsed.call_id, e);
+                }
+            }
+            Err(e) => warn!(
+                "Failed to build preaccept transport for {}: {}",
+                parsed.call_id, e
+            ),
+        }
+
+        let call_manager_clone = Arc::clone(&call_manager);
+        let call_id_clone = call_id.clone();
+        let parsed_call_id = parsed.call_id.clone();
+        tokio::spawn(async move {
+            match call_manager_clone
+                .connect_relay(&call_id_clone, &relay_data)
+                .await
+            {
+                Ok(relay_name) => info!(
+                    "Preaccept deferred WebRTC setup SUCCESS for {} on relay {}",
+                    parsed_call_id, relay_name
+                ),
+                Err(e) => warn!(
+                    "Preaccept deferred WebRTC setup FAILED for {}: {}",
+                    parsed_call_id, e
+                ),
+            }
+        });
     }
 }

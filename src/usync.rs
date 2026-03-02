@@ -9,7 +9,7 @@ use wacore::iq::usync::DeviceListSpec;
 use wacore_binary::jid::Jid;
 
 impl Client {
-    pub(crate) async fn get_user_devices(&self, jids: &[Jid]) -> Result<Vec<Jid>, anyhow::Error> {
+    pub async fn get_user_devices(&self, jids: &[Jid]) -> Result<Vec<Jid>, anyhow::Error> {
         debug!("get_user_devices: Using normal mode for {jids:?}");
 
         let mut jids_to_fetch: HashSet<Jid> = HashSet::new();

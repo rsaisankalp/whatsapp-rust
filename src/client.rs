@@ -2,6 +2,7 @@ mod call_crypto;
 mod context_impl;
 mod device_registry;
 mod lid_pn;
+mod privacy_tokens;
 mod sender_keys;
 mod sessions;
 
@@ -229,6 +230,10 @@ pub struct Client {
 
     /// Call manager for VoIP call handling (lazily initialized)
     pub(crate) call_manager: tokio::sync::RwLock<Option<Arc<crate::calls::CallManager>>>,
+
+    /// Cache of trusted contact privacy tokens keyed by normalized JID string.
+    /// Used when constructing call/profile privacy elements.
+    pub(crate) trusted_contact_tokens: Cache<String, Vec<u8>>,
 }
 
 impl Client {
@@ -355,6 +360,10 @@ impl Client {
             http_client,
             override_version,
             call_manager: tokio::sync::RwLock::new(None),
+            trusted_contact_tokens: Cache::builder()
+                .time_to_live(Duration::from_secs(30 * 24 * 3600)) // 30 days
+                .max_capacity(20_000)
+                .build(),
         };
 
         let arc = Arc::new(this);
@@ -440,6 +449,10 @@ impl Client {
                     .parse()
                     .expect("fallback JID '0@lid' is a valid constant")
             });
+        debug!(
+            "Initializing CallManager with our_jid={} (pn={:?}, lid={:?})",
+            our_jid, device.pn, device.lid
+        );
 
         let manager =
             crate::calls::CallManager::new(our_jid, crate::calls::CallManagerConfig::default());

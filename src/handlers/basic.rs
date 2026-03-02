@@ -67,6 +67,26 @@ impl StanzaHandler for AckHandler {
             && node.attrs.get("type").is_some_and(|t| t == "offer");
 
         if is_call_offer_ack {
+            if let Some(error_code) = node.attrs.get("error").map(|v| v.to_string()) {
+                let ack_call_id = node
+                    .get_optional_child("relay")
+                    .and_then(|relay| relay.attrs.get("call-id"))
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                let user_phash = node
+                    .get_optional_child("user")
+                    .and_then(|user| user.attrs.get("phash"))
+                    .map(|v| v.to_string());
+                warn!(
+                    "Offer ACK rejected: stanza_id={} call_id={} from={} error={} user_phash={:?}",
+                    node.attrs.get("id").map(|v| v.to_string()).unwrap_or_default(),
+                    ack_call_id,
+                    node.attrs.get("from").map(|v| v.to_string()).unwrap_or_default(),
+                    error_code,
+                    user_phash
+                );
+            }
+
             // Parse relay data from the ACK
             if let Some(relay_data) = parse_relay_data_from_ack(&node) {
                 // Extract call_id from the relay node
@@ -102,138 +122,152 @@ impl StanzaHandler for AckHandler {
                         debug!("Failed to store relay data for call {}: {}", call_id, e);
                     }
 
-                    // CRITICAL: Send latencies IMMEDIATELY using server-provided c2r_rtt estimates.
-                    // The server needs latencies from BOTH peers quickly to elect a common relay.
-                    // If we wait for binding (which can timeout), the peer may already be on a
-                    // different relay before we report our latencies.
-                    info!(
-                        "Sending relay latencies IMMEDIATELY using c2r_rtt for call {} ({} endpoints)",
-                        call_id,
-                        relay_data.endpoints.len()
-                    );
+                    let defer_outgoing_setup = std::env::var("WHATSAPP_CALL_DEFER_OUTGOING_SETUP")
+                        .ok()
+                        .map(|v| {
+                            let normalized = v.trim().to_ascii_lowercase();
+                            matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+                        })
+                        .unwrap_or(true);
 
-                    for endpoint in &relay_data.endpoints {
-                        // Get token for this endpoint
-                        let token = relay_data
-                            .relay_tokens
-                            .get(endpoint.token_id as usize)
-                            .cloned()
-                            .unwrap_or_default();
+                    if defer_outgoing_setup {
+                        info!(
+                            "Deferring relaylatency/transport/WebRTC setup for outgoing call {} until remote accepts",
+                            call_id
+                        );
+                    } else {
+                        // CRITICAL: Send latencies IMMEDIATELY using server-provided c2r_rtt estimates.
+                        // The server needs latencies from BOTH peers quickly to elect a common relay.
+                        // If we wait for binding (which can timeout), the peer may already be on a
+                        // different relay before we report our latencies.
+                        info!(
+                            "Sending relay latencies IMMEDIATELY using c2r_rtt for call {} ({} endpoints)",
+                            call_id,
+                            relay_data.endpoints.len()
+                        );
 
-                        // Get first IPv4 address
-                        let (ipv4, port) = endpoint
-                            .addresses
-                            .iter()
-                            .find_map(|addr| {
-                                addr.ipv4.as_ref().map(|ip| (Some(ip.clone()), addr.port))
-                            })
-                            .unwrap_or((None, 3478));
+                        for endpoint in &relay_data.endpoints {
+                            // Get token for this endpoint
+                            let token = relay_data
+                                .relay_tokens
+                                .get(endpoint.token_id as usize)
+                                .cloned()
+                                .unwrap_or_default();
 
-                        // Use server-provided c2r_rtt, fallback to 50ms if not available
-                        let latency_ms = endpoint.c2r_rtt_ms.unwrap_or(50);
+                            // Get first IPv4 address
+                            let (ipv4, port) = endpoint
+                                .addresses
+                                .iter()
+                                .find_map(|addr| {
+                                    addr.ipv4.as_ref().map(|ip| (Some(ip.clone()), addr.port))
+                                })
+                                .unwrap_or((None, 3478));
 
-                        let measurement = RelayLatencyMeasurement {
-                            relay_name: endpoint.relay_name.clone(),
-                            latency_ms,
-                            ipv4,
-                            port,
-                            token,
+                            // Use server-provided c2r_rtt, fallback to 50ms if not available
+                            let latency_ms = endpoint.c2r_rtt_ms.unwrap_or(50);
+
+                            let measurement = RelayLatencyMeasurement {
+                                relay_name: endpoint.relay_name.clone(),
+                                latency_ms,
+                                ipv4,
+                                port,
+                                token,
+                            };
+
+                            match call_manager
+                                .send_relay_latency(&call_id, vec![measurement.clone()])
+                                .await
+                            {
+                                Ok(stanza) => {
+                                    if let Err(e) = client.send_node(stanza).await {
+                                        warn!(
+                                            "Failed to send relay latency for {}: {}",
+                                            measurement.relay_name, e
+                                        );
+                                    } else {
+                                        info!(
+                                            "Sent relay latency for {} ({}ms c2r_rtt) for call {}",
+                                            measurement.relay_name, measurement.latency_ms, call_id
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to build relay latency stanza for {}: {}",
+                                        measurement.relay_name, e
+                                    );
+                                }
+                            }
+                        }
+
+                        info!(
+                            "Sent {} relay latencies using c2r_rtt for call {}",
+                            relay_data.endpoints.len(),
+                            call_id
+                        );
+
+                        // Send TRANSPORT stanza - this is CRITICAL for call setup.
+                        let transport_params = crate::calls::TransportParams {
+                            p2p_cand_round: Some(0),
+                            transport_message_type: Some(0),
+                            net_protocol: 0,
+                            net_medium: 2, // WiFi/LAN
                         };
 
                         match call_manager
-                            .send_relay_latency(&call_id, vec![measurement.clone()])
+                            .send_transport(&call_id, transport_params)
                             .await
                         {
-                            Ok(stanza) => {
-                                if let Err(e) = client.send_node(stanza).await {
+                            Ok(transport_node) => {
+                                if let Err(e) = client.send_node(transport_node).await {
                                     warn!(
-                                        "Failed to send relay latency for {}: {}",
-                                        measurement.relay_name, e
+                                        "Failed to send TRANSPORT stanza for call {}: {}",
+                                        call_id, e
                                     );
                                 } else {
-                                    info!(
-                                        "Sent relay latency for {} ({}ms c2r_rtt) for call {}",
-                                        measurement.relay_name, measurement.latency_ms, call_id
-                                    );
+                                    info!("Sent TRANSPORT stanza for call {}", call_id);
                                 }
                             }
                             Err(e) => {
                                 warn!(
-                                    "Failed to build relay latency stanza for {}: {}",
-                                    measurement.relay_name, e
-                                );
-                            }
-                        }
-                    }
-
-                    info!(
-                        "Sent {} relay latencies using c2r_rtt for call {}",
-                        relay_data.endpoints.len(),
-                        call_id
-                    );
-
-                    // Send TRANSPORT stanza - this is CRITICAL for call setup
-                    // The peer expects this to confirm candidate selection and transition state
-                    let transport_params = crate::calls::TransportParams {
-                        p2p_cand_round: Some(0),
-                        transport_message_type: Some(0),
-                        net_protocol: 0,
-                        net_medium: 2, // WiFi/LAN
-                    };
-
-                    match call_manager
-                        .send_transport(&call_id, transport_params)
-                        .await
-                    {
-                        Ok(transport_node) => {
-                            if let Err(e) = client.send_node(transport_node).await {
-                                warn!(
-                                    "Failed to send TRANSPORT stanza for call {}: {}",
+                                    "Failed to build TRANSPORT stanza for call {}: {}",
                                     call_id, e
                                 );
-                            } else {
-                                info!("Sent TRANSPORT stanza for call {}", call_id);
                             }
                         }
-                        Err(e) => {
-                            warn!(
-                                "Failed to build TRANSPORT stanza for call {}: {}",
-                                call_id, e
+
+                        // Now spawn background task for early WebRTC connection.
+                        // WebRTC handles ICE keepalives internally.
+                        let relay_data_clone = relay_data.clone();
+                        let call_id_clone = call_id.clone();
+                        let call_manager_clone = Arc::clone(&call_manager);
+                        tokio::spawn(async move {
+                            info!(
+                                "Starting background WebRTC connection for call {} ({} endpoints)",
+                                call_id_clone,
+                                relay_data_clone.endpoints.len()
                             );
-                        }
+
+                            match call_manager_clone
+                                .connect_relay(&call_id_clone, &relay_data_clone)
+                                .await
+                            {
+                                Ok(relay_name) => {
+                                    info!(
+                                        "Background WebRTC connection SUCCESSFUL for call {}: connected to {}",
+                                        call_id_clone, relay_name
+                                    );
+                                    // WebRTC handles keepalives internally via ICE
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Background WebRTC connection FAILED for call {}: {} - media connection may not work",
+                                        call_id_clone, e
+                                    );
+                                }
+                            }
+                        });
                     }
-
-                    // Now spawn background task for early WebRTC connection.
-                    // WebRTC handles ICE keepalives internally.
-                    let relay_data_clone = relay_data.clone();
-                    let call_id_clone = call_id.clone();
-                    let call_manager_clone = Arc::clone(&call_manager);
-                    tokio::spawn(async move {
-                        info!(
-                            "Starting background WebRTC connection for call {} ({} endpoints)",
-                            call_id_clone,
-                            relay_data_clone.endpoints.len()
-                        );
-
-                        match call_manager_clone
-                            .connect_relay(&call_id_clone, &relay_data_clone)
-                            .await
-                        {
-                            Ok(relay_name) => {
-                                info!(
-                                    "Background WebRTC connection SUCCESSFUL for call {}: connected to {}",
-                                    call_id_clone, relay_name
-                                );
-                                // WebRTC handles keepalives internally via ICE
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "Background WebRTC connection FAILED for call {}: {} - media connection may not work",
-                                    call_id_clone, e
-                                );
-                            }
-                        }
-                    });
                 }
             }
         }

@@ -923,6 +923,7 @@ pub struct CallStanzaBuilder {
     group_jid: Option<Jid>,
     payload: Option<Vec<u8>>,
     extra_attrs: HashMap<String, String>,
+    call_attrs: HashMap<String, String>,
     /// Stanza ID for the outer `<call>` element (for routing and acks).
     stanza_id: Option<String>,
     /// Encrypted call key for offer/accept stanzas.
@@ -969,6 +970,7 @@ impl CallStanzaBuilder {
             group_jid: None,
             payload: None,
             extra_attrs: HashMap::new(),
+            call_attrs: HashMap::new(),
             stanza_id: None,
             encrypted_key: None,
             audio_params: Vec::new(),
@@ -1011,6 +1013,12 @@ impl CallStanzaBuilder {
 
     pub fn attr(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.extra_attrs.insert(key.into(), value.into());
+        self
+    }
+
+    /// Add an attribute to the outer `<call>` node.
+    pub fn call_attr(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.call_attrs.insert(key.into(), value.into());
         self
     }
 
@@ -1214,8 +1222,9 @@ impl CallStanzaBuilder {
             if self.signaling_type == SignalingType::Offer
                 && let Some(ref privacy_bytes) = self.privacy
             {
-                let hex: String = privacy_bytes.iter().map(|b| format!("{:02X}", b)).collect();
-                let privacy_node = NodeBuilder::new("privacy").string_content(&hex).build();
+                let privacy_node = NodeBuilder::new("privacy")
+                    .bytes(privacy_bytes.clone())
+                    .build();
                 children.push(privacy_node);
             }
 
@@ -1311,11 +1320,15 @@ impl CallStanzaBuilder {
         });
 
         // Build outer call stanza with id attribute
-        NodeBuilder::new("call")
+        let mut call_builder = NodeBuilder::new("call")
             .attr("to", self.to.to_string())
-            .attr("id", stanza_id)
-            .children(std::iter::once(signaling_node))
-            .build()
+            .attr("id", stanza_id);
+
+        for (k, v) in &self.call_attrs {
+            call_builder = call_builder.attr(k.clone(), v.clone());
+        }
+
+        call_builder.children(std::iter::once(signaling_node)).build()
     }
 }
 
