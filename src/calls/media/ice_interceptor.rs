@@ -185,15 +185,14 @@ impl RelayUdpConn {
         }
     }
 
-    /// Send an authenticated STUN Binding Request with subscription attributes
-    /// BEFORE the WebRTC ICE agent takes over. This is the key to registering
-    /// sender/receiver subscriptions with the relay.
+    /// Send STUN Binding Requests with subscription attributes BEFORE the WebRTC
+    /// ICE agent takes over. Tries multiple auth strategies:
+    ///
+    /// 1. No auth + subscriptions (relay responds to unauthenticated STUN)
+    /// 2. USERNAME only (no MESSAGE-INTEGRITY) + subscriptions
+    /// 3. Full ICE auth (USERNAME:dummy + MESSAGE-INTEGRITY) + subscriptions
     ///
     /// Must be called BEFORE UDPMux takes ownership of this connection.
-    ///
-    /// The relay processes 0x4000 (SenderSubscriptions) and 0x4001 (ReceiverSubscription)
-    /// attributes from authenticated STUN Binding Requests. After ICE takes over,
-    /// the relay ignores late subscription binds (treats them as consent checks).
     pub async fn pre_ice_bind_with_subscriptions(
         &self,
         auth_token: &[u8],
@@ -203,128 +202,224 @@ impl RelayUdpConn {
     ) -> io::Result<PreIceBindResult> {
         use super::stun::StunMessage;
 
-        // Generate transaction ID
-        let mut txn_id = [0u8; 12];
-        {
-            use rand::RngCore;
-            rand::rng().fill_bytes(&mut txn_id);
-        }
-
-        // Build authenticated STUN Binding Request with subscription attributes
-        let mut bind = StunMessage::binding_request(txn_id)
-            .with_username(auth_token)
-            .with_integrity_key(relay_key);
-
-        if !sender_subs.is_empty() {
-            bind = bind.with_sender_subscriptions(sender_subs.to_vec());
-        }
-        if !receiver_subs.is_empty() {
-            bind = bind.with_receiver_subscription(receiver_subs.to_vec());
-        }
-
-        let bind_data = bind.encode();
         info!(
-            "Pre-ICE STUN Bind: sending {} bytes to {} (txn={:02x?}, sender_subs={} bytes, receiver_subs={} bytes)",
-            bind_data.len(),
+            "Pre-ICE subscription bind to {} (auth_token={} bytes, sender_subs={} bytes, receiver_subs={} bytes)",
             self.remote_addr,
-            &txn_id[..4],
+            auth_token.len(),
             sender_subs.len(),
             receiver_subs.len(),
         );
 
-        // Send with retries (up to 3 attempts)
-        let max_attempts = 3;
-        for attempt in 1..=max_attempts {
-            let sent = self.socket.send_to(&bind_data, self.remote_addr).await?;
+        // Strategy 1: No auth, just subscription attributes
+        // The relay responds to bare STUN, so it might accept subscriptions without auth
+        {
+            let mut txn_id = [0u8; 12];
+            rand::RngCore::fill_bytes(&mut rand::rng(), &mut txn_id);
+
+            let mut bind = StunMessage::binding_request(txn_id)
+                .with_priority(None); // No ICE priority for simple bind
+
+            if !sender_subs.is_empty() {
+                bind = bind.with_sender_subscriptions(sender_subs.to_vec());
+            }
+            if !receiver_subs.is_empty() {
+                bind = bind.with_receiver_subscription(receiver_subs.to_vec());
+            }
+
+            let bind_data = bind.encode();
             info!(
-                "Pre-ICE STUN Bind attempt {}/{}: sent {} bytes",
-                attempt, max_attempts, sent
+                "Pre-ICE strategy 1 (no auth + subs): {} bytes, txn={:02x?}",
+                bind_data.len(), &txn_id[..4]
             );
 
-            // Wait for response (2s per attempt)
-            let mut buf = [0u8; 1500];
-            match tokio::time::timeout(
-                Duration::from_secs(2),
-                self.socket.recv_from(&mut buf),
-            )
-            .await
-            {
-                Ok(Ok((len, from))) => {
-                    info!(
-                        "Pre-ICE Bind: received {} bytes from {} (first20={:02x?})",
-                        len, from, &buf[..len.min(20)]
-                    );
-
-                    if let Ok(response) = StunMessage::decode(&buf[..len]) {
-                        // Log all attributes in the response
-                        for attr in &response.attributes {
-                            info!("Pre-ICE Bind response attr: {:?}", attr);
-                        }
-
-                        if response.transaction_id == txn_id {
-                            if response.is_success() {
-                                let mapped = response.mapped_address();
-                                info!(
-                                    "Pre-ICE STUN Bind SUCCESS! mapped_addr={:?}, {} bytes from {}",
-                                    mapped, len, from
-                                );
-                                return Ok(PreIceBindResult {
-                                    success: true,
-                                    mapped_address: mapped,
-                                    response_bytes: buf[..len].to_vec(),
-                                });
-                            } else if response.is_error() {
-                                let (code, reason) =
-                                    response.error_code().unwrap_or((0, "unknown"));
-                                warn!(
-                                    "Pre-ICE STUN Bind ERROR: code={}, reason='{}'",
-                                    code, reason
-                                );
-                                // Don't retry on auth errors - wrong credentials
-                                if code == 401 || code == 403 {
-                                    return Ok(PreIceBindResult {
-                                        success: false,
-                                        mapped_address: None,
-                                        response_bytes: buf[..len].to_vec(),
-                                    });
-                                }
-                            }
-                        } else {
-                            info!(
-                                "Pre-ICE Bind: txn mismatch (expected {:02x?}, got {:02x?})",
-                                &txn_id[..4],
-                                &response.transaction_id[..4]
-                            );
-                        }
-                    } else {
-                        info!(
-                            "Pre-ICE Bind: received non-STUN response ({} bytes, first_byte=0x{:02x})",
-                            len,
-                            buf[0]
-                        );
-                    }
-                }
-                Ok(Err(e)) => {
-                    warn!("Pre-ICE Bind attempt {}: recv error: {}", attempt, e);
-                }
-                Err(_) => {
-                    info!(
-                        "Pre-ICE Bind attempt {}/{}: timeout (2s)",
-                        attempt, max_attempts
-                    );
+            if let Some(result) = self.send_and_wait_stun(&bind_data, &txn_id, "strategy1-noauth").await? {
+                if result.success {
+                    info!("Pre-ICE strategy 1 (no auth) SUCCEEDED!");
+                    return Ok(result);
                 }
             }
         }
 
-        warn!(
-            "Pre-ICE STUN Bind: no matching response after {} attempts from {}",
-            max_attempts, self.remote_addr
-        );
+        // Strategy 2: USERNAME only (no MESSAGE-INTEGRITY) + subscriptions
+        {
+            let mut txn_id = [0u8; 12];
+            rand::RngCore::fill_bytes(&mut rand::rng(), &mut txn_id);
+
+            let mut bind = StunMessage::binding_request(txn_id)
+                .with_username(auth_token)
+                .with_priority(None);
+
+            if !sender_subs.is_empty() {
+                bind = bind.with_sender_subscriptions(sender_subs.to_vec());
+            }
+            if !receiver_subs.is_empty() {
+                bind = bind.with_receiver_subscription(receiver_subs.to_vec());
+            }
+
+            let bind_data = bind.encode();
+            info!(
+                "Pre-ICE strategy 2 (username + subs, no integrity): {} bytes, txn={:02x?}",
+                bind_data.len(), &txn_id[..4]
+            );
+
+            if let Some(result) = self.send_and_wait_stun(&bind_data, &txn_id, "strategy2-username").await? {
+                if result.success {
+                    info!("Pre-ICE strategy 2 (username only) SUCCEEDED!");
+                    return Ok(result);
+                }
+            }
+        }
+
+        // Strategy 3: Full auth (USERNAME + MESSAGE-INTEGRITY) + subscriptions
+        {
+            let mut txn_id = [0u8; 12];
+            rand::RngCore::fill_bytes(&mut rand::rng(), &mut txn_id);
+
+            let mut bind = StunMessage::binding_request(txn_id)
+                .with_username(auth_token)
+                .with_integrity_key(relay_key);
+
+            if !sender_subs.is_empty() {
+                bind = bind.with_sender_subscriptions(sender_subs.to_vec());
+            }
+            if !receiver_subs.is_empty() {
+                bind = bind.with_receiver_subscription(receiver_subs.to_vec());
+            }
+
+            let bind_data = bind.encode();
+            info!(
+                "Pre-ICE strategy 3 (full auth + subs): {} bytes, txn={:02x?}",
+                bind_data.len(), &txn_id[..4]
+            );
+
+            if let Some(result) = self.send_and_wait_stun(&bind_data, &txn_id, "strategy3-fullauth").await? {
+                if result.success {
+                    info!("Pre-ICE strategy 3 (full auth) SUCCEEDED!");
+                    return Ok(result);
+                }
+            }
+        }
+
+        // Strategy 4: USERNAME with ICE format (ufrag:dummy) + MESSAGE-INTEGRITY + subscriptions
+        // ICE uses USERNAME = remote_ufrag:local_ufrag format
+        {
+            let mut txn_id = [0u8; 12];
+            rand::RngCore::fill_bytes(&mut rand::rng(), &mut txn_id);
+
+            // Build ICE-style username: auth_token:wabot
+            let ice_username = {
+                let mut u = auth_token.to_vec();
+                u.extend_from_slice(b":wabot");
+                u
+            };
+
+            let mut bind = StunMessage::binding_request(txn_id)
+                .with_username(&ice_username)
+                .with_integrity_key(relay_key);
+
+            if !sender_subs.is_empty() {
+                bind = bind.with_sender_subscriptions(sender_subs.to_vec());
+            }
+            if !receiver_subs.is_empty() {
+                bind = bind.with_receiver_subscription(receiver_subs.to_vec());
+            }
+
+            let bind_data = bind.encode();
+            info!(
+                "Pre-ICE strategy 4 (ICE-format username + subs): {} bytes, txn={:02x?}",
+                bind_data.len(), &txn_id[..4]
+            );
+
+            if let Some(result) = self.send_and_wait_stun(&bind_data, &txn_id, "strategy4-iceformat").await? {
+                if result.success {
+                    info!("Pre-ICE strategy 4 (ICE format) SUCCEEDED!");
+                    return Ok(result);
+                }
+            }
+        }
+
+        warn!("Pre-ICE STUN Bind: all 4 strategies failed for {}", self.remote_addr);
         Ok(PreIceBindResult {
             success: false,
             mapped_address: None,
             response_bytes: Vec::new(),
         })
+    }
+
+    /// Helper: send a STUN message and wait for a matching response.
+    /// Returns Some(result) if we got any response, None on timeout.
+    async fn send_and_wait_stun(
+        &self,
+        data: &[u8],
+        txn_id: &[u8; 12],
+        label: &str,
+    ) -> io::Result<Option<PreIceBindResult>> {
+        use super::stun::StunMessage;
+
+        let sent = self.socket.send_to(data, self.remote_addr).await?;
+        info!("Pre-ICE {}: sent {} bytes to {}", label, sent, self.remote_addr);
+
+        let mut buf = [0u8; 1500];
+        match tokio::time::timeout(Duration::from_millis(2500), self.socket.recv_from(&mut buf)).await {
+            Ok(Ok((len, from))) => {
+                info!(
+                    "Pre-ICE {}: received {} bytes from {} (first20={:02x?})",
+                    label, len, from, &buf[..len.min(20)]
+                );
+
+                if let Ok(response) = StunMessage::decode(&buf[..len]) {
+                    for attr in &response.attributes {
+                        info!("Pre-ICE {} response attr: {:?}", label, attr);
+                    }
+
+                    if response.transaction_id == *txn_id {
+                        if response.is_success() {
+                            let mapped = response.mapped_address();
+                            info!("Pre-ICE {} SUCCESS! mapped={:?}", label, mapped);
+                            return Ok(Some(PreIceBindResult {
+                                success: true,
+                                mapped_address: mapped,
+                                response_bytes: buf[..len].to_vec(),
+                            }));
+                        } else if response.is_error() {
+                            let (code, reason) = response.error_code().unwrap_or((0, "unknown"));
+                            warn!("Pre-ICE {} ERROR: code={}, reason='{}'", label, code, reason);
+                            return Ok(Some(PreIceBindResult {
+                                success: false,
+                                mapped_address: None,
+                                response_bytes: buf[..len].to_vec(),
+                            }));
+                        }
+                    } else {
+                        info!(
+                            "Pre-ICE {}: txn mismatch (expected {:02x?}, got {:02x?})",
+                            label, &txn_id[..4], &response.transaction_id[..4]
+                        );
+                        // Got a response but wrong txn - return as failure with data
+                        return Ok(Some(PreIceBindResult {
+                            success: false,
+                            mapped_address: None,
+                            response_bytes: buf[..len].to_vec(),
+                        }));
+                    }
+                } else {
+                    info!("Pre-ICE {}: non-STUN response ({} bytes)", label, len);
+                    return Ok(Some(PreIceBindResult {
+                        success: false,
+                        mapped_address: None,
+                        response_bytes: buf[..len].to_vec(),
+                    }));
+                }
+            }
+            Ok(Err(e)) => {
+                warn!("Pre-ICE {}: recv error: {}", label, e);
+            }
+            Err(_) => {
+                info!("Pre-ICE {}: timeout (2.5s)", label);
+            }
+        }
+
+        Ok(None)
     }
 
     /// Send a TURN Allocate Request with subscription attributes before ICE.
