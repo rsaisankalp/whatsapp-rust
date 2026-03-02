@@ -1326,6 +1326,8 @@ async fn start_media_automation_session(
 
     let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
+    // Try BOTH raw UDP and DataChannel for media delivery
+    let use_raw_media = env_bool("WHATSAPP_CALL_RAW_MEDIA", true);
     let send_stop = stop.clone();
     let send_call_id = call_id.clone();
     let send_call_manager = call_manager.clone();
@@ -1366,6 +1368,19 @@ async fn start_media_automation_session(
                 }
             };
 
+            // Send via raw UDP to relay (transport-level, bypassing DTLS/SCTP)
+            if use_raw_media {
+                if let Err(e) = send_call_manager
+                    .send_raw_via_webrtc(&send_call_id, &encrypted)
+                    .await
+                {
+                    if sent_packets == 0 {
+                        debug!("Raw UDP media send failed for {} (will try DataChannel too): {}", send_call_id, e);
+                    }
+                }
+            }
+
+            // Also send via DataChannel (DTLS/SCTP path)
             if let Err(e) = send_call_manager
                 .send_via_webrtc(&send_call_id, &encrypted)
                 .await
@@ -1379,17 +1394,22 @@ async fn start_media_automation_session(
                     send_stop.store(true, Ordering::Relaxed);
                     break;
                 }
-                warn!("WebRTC send failed for {}: {}", send_call_id, e);
+                if !use_raw_media {
+                    warn!("WebRTC send failed for {}: {}", send_call_id, e);
+                }
                 continue;
             }
 
             sent_packets += 1;
+            if sent_packets == 1 {
+                info!("First media packet sent for {} (raw_udp={}, {} bytes)", send_call_id, use_raw_media, encrypted.len());
+            }
             if sent_packets.is_multiple_of(200) {
                 debug!("Sent {} media packets for {}", sent_packets, send_call_id);
             }
         }
 
-        info!("Send loop stopped for call {}", send_call_id);
+        info!("Send loop stopped for call {} ({} packets sent)", send_call_id, sent_packets);
     });
 
     if config.sample_audio_on_connect {
@@ -1400,8 +1420,8 @@ async fn start_media_automation_session(
         let sample_freq = config.sample_audio_frequency_hz;
         let sample_frame_ms = frame_ms;
         tokio::spawn(async move {
-            // Wait for call media to stabilize before injecting the sample.
-            tokio::time::sleep(Duration::from_millis(800)).await;
+            // Start sample audio quickly after media setup.
+            tokio::time::sleep(Duration::from_millis(100)).await;
             if sample_stop.load(Ordering::Relaxed) {
                 return;
             }
@@ -1552,12 +1572,12 @@ async fn start_media_automation_session(
             }
 
             if packet_signature_logs < recv_config.packet_signature_debug_count {
-                debug!(
-                    "Non-STUN packet #{} for {}: len={}, first16={:02x?}",
+                info!(
+                    "Non-STUN DC msg #{} for {}: len={}, first32={:02x?}",
                     packet_signature_logs + 1,
                     recv_call_id,
                     data.len(),
-                    &data[..data.len().min(16)]
+                    &data[..data.len().min(32)]
                 );
                 packet_signature_logs += 1;
             }
@@ -1858,6 +1878,9 @@ async fn perform_stun_allocate(
 
     let transaction_id = generate_transaction_id();
     let include_sender_subscriptions = env_bool("WHATSAPP_CALL_STUN_SENDER_SUBS", false);
+    let allocate_no_integrity = env_bool("WHATSAPP_CALL_STUN_ALLOCATE_NO_INTEGRITY", false);
+    let allocate_no_username = env_bool("WHATSAPP_CALL_STUN_ALLOCATE_NO_USERNAME", false);
+    let allocate_no_fingerprint = env_bool("WHATSAPP_CALL_STUN_ALLOCATE_NO_FINGERPRINT", false);
     let sender_subscriptions = if include_sender_subscriptions {
         if let Some(call_info) = call_manager.get_call(call_id).await {
             let sender_jid = call_info.call_creator.to_string();
@@ -1874,9 +1897,16 @@ async fn perform_stun_allocate(
     };
 
     let build_allocate = |tx_id: [u8; 12], realm: Option<&str>, nonce: Option<&[u8]>| {
-        let mut msg = StunMessage::allocate_request(tx_id)
-            .with_username(auth_token)
-            .with_integrity_key(relay_key);
+        let mut msg = StunMessage::allocate_request(tx_id);
+        if allocate_no_fingerprint {
+            msg = msg.with_fingerprint(false);
+        }
+        if !allocate_no_username {
+            msg = msg.with_username(auth_token);
+        }
+        if !allocate_no_integrity {
+            msg = msg.with_integrity_key(relay_key);
+        }
         if include_sender_subscriptions {
             msg = msg.with_sender_subscriptions(sender_subscriptions.clone());
         }
@@ -1890,6 +1920,10 @@ async fn perform_stun_allocate(
     };
 
     let initial = build_allocate(transaction_id, None, None);
+    debug!(
+        "STUN Allocate options for {}: sender_subs={} no_username={} no_integrity={} no_fingerprint={}",
+        call_id, include_sender_subscriptions, allocate_no_username, allocate_no_integrity, allocate_no_fingerprint
+    );
     call_manager
         .send_via_webrtc(call_id, &initial.encode())
         .await
@@ -2007,116 +2041,156 @@ async fn perform_stun_bind_with_subscriptions(
         );
     }
 
-    let mut bind = StunMessage::binding_request(generate_transaction_id())
-        .with_username(auth_token)
-        .with_integrity_key(relay_key);
     let call_info = call_manager.get_call(call_id).await;
     let sender_jid = call_info.as_ref().map(|c| c.call_creator.to_string());
     let self_pid = relay_options.as_ref().and_then(|r| r.self_pid);
 
-    if disable_ssrc_subscription {
-        info!(
-            "Using app-data sender subscription in STUN bind for {} (disable_ssrc_subscription=true, self_pid={:?})",
-            call_id, self_pid
-        );
-        let app_data_subscription =
-            create_app_data_sender_subscriptions(self_pid, sender_jid.clone());
-        bind = bind.with_sender_subscriptions(app_data_subscription);
+    // Build audio sender subscription
+    let audio_subs = if let Some(ref jid) = sender_jid {
+        create_audio_sender_subscriptions_with_jid(ssrc, jid.clone())
     } else {
-        let sender_subscriptions = if let Some(sender_jid) = sender_jid {
-            create_audio_sender_subscriptions_with_jid(ssrc, sender_jid)
-        } else {
-            create_audio_sender_subscriptions(ssrc)
-        };
-        bind = bind.with_sender_subscriptions(sender_subscriptions);
-        debug!(
-            "Using audio sender subscription in STUN bind for {} (ssrc={})",
-            call_id, ssrc
-        );
-    }
-    let bind_data = bind.encode();
-    debug!(
-        "Sending STUN Bind for {} ({} bytes)",
-        call_id,
-        bind_data.len()
+        create_audio_sender_subscriptions(ssrc)
+    };
+
+    // Build app-data sender subscription
+    let app_data_subs = create_app_data_sender_subscriptions(self_pid, sender_jid.clone());
+
+    info!(
+        "STUN Bind setup for {}: ssrc={}, self_pid={:?}, sender_jid={:?}, audio_subs={} bytes, app_data_subs={} bytes",
+        call_id, ssrc, self_pid, sender_jid, audio_subs.len(), app_data_subs.len()
     );
 
-    call_manager
-        .send_via_webrtc(call_id, &bind_data)
-        .await
-        .map_err(|e| format!("STUN Bind send failed: {}", e))?;
+    // Build STUN bind with subscriptions
+    let mut bind = StunMessage::binding_request(generate_transaction_id())
+        .with_username(auth_token)
+        .with_integrity_key(relay_key)
+        .with_priority(None)  // No ICE PRIORITY for relay bind
+        .with_sender_subscriptions(audio_subs.clone());
 
-    let bind_total_ms = env_u64("WHATSAPP_CALL_STUN_BIND_TOTAL_MS", 4000);
-    let bind_retry_ms = env_u64("WHATSAPP_CALL_STUN_BIND_RETRY_MS", 500).max(100);
+    let bind_data = bind.encode();
+    info!(
+        "STUN Bind for {} ({} bytes) first20={:02x?}",
+        call_id,
+        bind_data.len(),
+        &bind_data[..bind_data.len().min(20)]
+    );
+
+    // STRATEGY: Send STUN bind on the SHARED UDP socket (same as ICE/DTLS)
+    // This ensures the relay sees it from the same source IP:port as our authenticated connection.
+    let mut shared_socket_sent = false;
+    match call_manager.send_raw_via_webrtc(call_id, &bind_data).await {
+        Ok(n) => {
+            info!("Sent STUN Bind on SHARED socket for {} ({} bytes) - relay will see it from same port as ICE/DTLS", call_id, n);
+            shared_socket_sent = true;
+        }
+        Err(e) => {
+            warn!("Shared socket STUN Bind failed for {}: {}", call_id, e);
+        }
+    }
+
+    // Also send via DataChannel as fallback (relay may process STUN from DataChannel too)
+    if let Err(e) = call_manager.send_via_webrtc(call_id, &bind_data).await {
+        debug!("DataChannel STUN Bind send failed for {}: {}", call_id, e);
+    } else {
+        info!("Also sent STUN Bind via DataChannel for {} ({} bytes)", call_id, bind_data.len());
+    }
+
+    // Wait for response on BOTH interceptor (raw UDP) and DataChannel
+    let bind_total_ms = env_u64("WHATSAPP_CALL_STUN_BIND_TOTAL_MS", 5000);
+    let bind_retry_ms = env_u64("WHATSAPP_CALL_STUN_BIND_RETRY_MS", 800).max(200);
     let mut bind_attempts = 1u32;
-    let mut bind_stun_logs = 0usize;
     let mut last_bind_send = Instant::now();
+    let mut dc_msg_count = 0usize;
+    let mut intercepted_count = 0usize;
     let start = Instant::now();
+
     while start.elapsed() < Duration::from_millis(bind_total_ms) {
+        // Retry periodically
         if last_bind_send.elapsed() >= Duration::from_millis(bind_retry_ms) {
-            if let Err(e) = call_manager.send_via_webrtc(call_id, &bind_data).await {
-                debug!("STUN Bind retry send failed for {}: {}", call_id, e);
-            } else {
-                bind_attempts = bind_attempts.saturating_add(1);
+            let retry_bind = StunMessage::binding_request(generate_transaction_id())
+                .with_username(auth_token)
+                .with_integrity_key(relay_key)
+                .with_priority(None)
+                .with_sender_subscriptions(audio_subs.clone());
+            let retry_data = retry_bind.encode();
+
+            if shared_socket_sent {
+                let _ = call_manager.send_raw_via_webrtc(call_id, &retry_data).await;
             }
+            let _ = call_manager.send_via_webrtc(call_id, &retry_data).await;
+            bind_attempts += 1;
             last_bind_send = Instant::now();
         }
 
-        match call_manager
-            .recv_from_webrtc_timeout(call_id, Duration::from_millis(250))
-            .await
-        {
+        // Check interceptor (raw UDP responses) - non-blocking
+        match call_manager.recv_intercepted_from_webrtc(call_id, Duration::from_millis(50)).await {
             Ok(data) => {
-                if let Ok(stun) = StunMessage::decode(&data) {
-                    if bind_stun_logs < 24 {
-                        debug!(
-                            "STUN packet during bind for {}: type={:?}, len={}, txid={:02x?}",
-                            call_id,
-                            stun.msg_type,
-                            data.len(),
-                            stun.transaction_id
-                        );
-                        bind_stun_logs += 1;
+                intercepted_count += 1;
+                let first_byte: u8 = data.first().copied().unwrap_or(0);
+                info!(
+                    "INTERCEPTED UDP #{} for {} bind: len={}, first_byte=0x{:02x}, first20={:02x?}",
+                    intercepted_count,
+                    call_id,
+                    data.len(),
+                    first_byte,
+                    &data[..data.len().min(20)]
+                );
+
+                // Check for STUN Binding Response
+                if first_byte <= 3 {
+                    if let Ok(stun) = StunMessage::decode(&data) {
+                        if matches!(stun.msg_type, StunMessageType::BindingResponse) {
+                            info!("STUN Bind SUCCESS for {} via SHARED socket (intercepted)!", call_id);
+                            return Ok(());
+                        }
+                        if stun.is_error() {
+                            let (code, reason) = stun.error_code().unwrap_or((0, "unknown"));
+                            warn!("STUN Bind error for {} (intercepted): code={}, reason={}", call_id, code, reason);
+                        }
+                        info!("Intercepted STUN msg type=0x{:04x} for {}", stun.msg_type as u16, call_id);
                     }
+                }
+            }
+            Err(_) => {} // timeout, check DataChannel next
+        }
+
+        // Check DataChannel messages
+        match call_manager.recv_from_webrtc_timeout(call_id, Duration::from_millis(50)).await {
+            Ok(data) => {
+                dc_msg_count += 1;
+                if dc_msg_count <= 50 {
+                    info!(
+                        "DC msg #{} for {} bind: len={}, first20={:02x?}",
+                        dc_msg_count,
+                        call_id,
+                        data.len(),
+                        &data[..data.len().min(20)]
+                    );
+                }
+
+                if let Ok(stun) = StunMessage::decode(&data) {
                     if stun.is_ping() {
                         let pong = StunMessage::whatsapp_pong(stun.transaction_id).encode();
-                        if let Err(e) = call_manager.send_via_webrtc(call_id, &pong).await {
-                            debug!(
-                                "Failed sending STUN pong for {} during bind: {}",
-                                call_id, e
-                            );
-                        }
+                        let _ = call_manager.send_via_webrtc(call_id, &pong).await;
                         continue;
                     }
-
                     if matches!(stun.msg_type, StunMessageType::BindingResponse) {
-                        info!("STUN Bind successful for call {}", call_id);
+                        info!("STUN Bind SUCCESS for {} via DataChannel!", call_id);
                         return Ok(());
                     }
                     if stun.is_error() {
                         let (code, reason) = stun.error_code().unwrap_or((0, "unknown"));
-                        debug!(
-                            "STUN Bind error for {}: code={} reason={}",
-                            call_id, code, reason
-                        );
-                    }
-                    if matches!(stun.msg_type, StunMessageType::WhatsAppPong) {
-                        debug!("Received STUN pong for {} during bind wait", call_id);
+                        warn!("STUN Bind error for {} (DC): code={}, reason={}", call_id, code, reason);
                     }
                 }
             }
-            Err(e) => {
-                let err = e.to_string().to_lowercase();
-                if !err.contains("timeout") {
-                    debug!("STUN Bind receive error for {}: {}", call_id, e);
-                }
-            }
+            Err(_) => {} // timeout
         }
     }
 
-    debug!(
-        "STUN Bind timed out for {} after {} attempts (continuing media startup)",
-        call_id, bind_attempts
+    info!(
+        "STUN Bind phase completed for {} after {} attempts (shared_socket={}, dc_msgs={}, intercepted={}, continuing media startup)",
+        call_id, bind_attempts, shared_socket_sent, dc_msg_count, intercepted_count
     );
     Ok(())
 }

@@ -1169,6 +1169,37 @@ impl CallManager {
             .map_err(|e| CallError::Transport(format!("WebRTC send failed: {}", e)))
     }
 
+    /// Send raw UDP data to the relay (bypassing DTLS/SCTP/DataChannel).
+    /// Used for STUN binding requests that must be processed at the relay transport layer.
+    pub async fn send_raw_via_webrtc(&self, call_id: &CallId, data: &[u8]) -> Result<usize, CallError> {
+        let transports = self.webrtc_transports.read().await;
+        let transport = transports
+            .get(call_id.as_str())
+            .ok_or_else(|| CallError::NotFound(format!("No WebRTC transport for {}", call_id)))?;
+
+        transport
+            .send_raw_to_relay(data)
+            .await
+            .map_err(|e| CallError::Transport(format!("Raw UDP send failed: {}", e)))
+    }
+
+    /// Receive an intercepted packet from the shared relay UDP socket.
+    /// Returns STUN responses and RTP/SRTP packets that arrive at the raw UDP level.
+    pub async fn recv_intercepted_from_webrtc(
+        &self,
+        call_id: &CallId,
+        timeout: std::time::Duration,
+    ) -> Result<Vec<u8>, CallError> {
+        let transports = self.webrtc_transports.read().await;
+        let transport = transports
+            .get(call_id.as_str())
+            .ok_or_else(|| CallError::NotFound(format!("No WebRTC transport for {}", call_id)))?;
+        transport
+            .recv_intercepted_timeout(timeout)
+            .await
+            .map_err(|e| CallError::Transport(format!("Intercepted recv failed: {}", e)))
+    }
+
     /// Receive data from the WebRTC DataChannel.
     ///
     /// This is a non-blocking call that returns immediately if no data is available.

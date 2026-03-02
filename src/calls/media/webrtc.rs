@@ -149,6 +149,14 @@ pub struct WebRtcTransport {
     tx: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
     /// Connected relay info.
     connected_relay: Mutex<Option<RelayConnectionInfo>>,
+    /// Shared UDP socket from RelayUdpConn (same socket as WebRTC stack).
+    /// Sends on this go to the relay from the same IP:port as ICE/DTLS.
+    relay_socket: Mutex<Option<Arc<tokio::net::UdpSocket>>>,
+    /// Remote relay address.
+    relay_addr: Mutex<Option<SocketAddr>>,
+    /// Interceptor channel: receives copies of incoming STUN + RTP/SRTP packets
+    /// from the shared UDP socket (bypassing the WebRTC mux).
+    interceptor_rx: Mutex<Option<tokio::sync::mpsc::Receiver<Vec<u8>>>>,
 }
 
 impl WebRtcTransport {
@@ -162,6 +170,9 @@ impl WebRtcTransport {
             rx: Mutex::new(None),
             tx: Mutex::new(None),
             connected_relay: Mutex::new(None),
+            relay_socket: Mutex::new(None),
+            relay_addr: Mutex::new(None),
+            interceptor_rx: Mutex::new(None),
         }
     }
 
@@ -327,13 +338,18 @@ impl WebRtcTransport {
             let (result, _index, rest) = select_all(remaining).await;
 
             match result {
-                Ok(Ok((relay_info, peer_connection, data_channel, tx, rx))) => {
+                Ok(Ok((relay_info, peer_connection, data_channel, tx, rx, shared_sock, shared_addr, int_rx))) => {
                     // Store the successful connection
                     *self.peer_connection.lock().await = Some(peer_connection.clone());
                     *self.data_channel.lock().await = Some(data_channel);
                     *self.tx.lock().await = Some(tx);
                     *self.rx.lock().await = Some(rx);
                     *self.connected_relay.lock().await = Some(relay_info.clone());
+                    // Use the SHARED socket from RelayUdpConn (same socket as WebRTC stack)
+                    info!("Using SHARED relay socket for raw sends to {} (same port as ICE/DTLS)", shared_addr);
+                    *self.relay_socket.lock().await = Some(shared_sock);
+                    *self.relay_addr.lock().await = Some(shared_addr);
+                    *self.interceptor_rx.lock().await = Some(int_rx);
                     *self.state.write().await = WebRtcState::Connected;
 
                     // Abort remaining connection attempts
@@ -392,13 +408,18 @@ impl WebRtcTransport {
             let (result, _index, rest) = select_all(remaining).await;
 
             match result {
-                Ok(Ok((relay_info, peer_connection, data_channel, tx, rx))) => {
+                Ok(Ok((relay_info, peer_connection, data_channel, tx, rx, shared_sock, shared_addr, int_rx))) => {
                     // Store the successful connection
                     *self.peer_connection.lock().await = Some(peer_connection.clone());
                     *self.data_channel.lock().await = Some(data_channel);
                     *self.tx.lock().await = Some(tx);
                     *self.rx.lock().await = Some(rx);
                     *self.connected_relay.lock().await = Some(relay_info.clone());
+                    // Use the SHARED socket from RelayUdpConn (same socket as WebRTC stack)
+                    info!("Using SHARED relay socket for raw sends to {} (same port as ICE/DTLS)", shared_addr);
+                    *self.relay_socket.lock().await = Some(shared_sock);
+                    *self.relay_addr.lock().await = Some(shared_addr);
+                    *self.interceptor_rx.lock().await = Some(int_rx);
                     *self.state.write().await = WebRtcState::Connected;
 
                     // Abort remaining connection attempts
@@ -438,6 +459,9 @@ impl WebRtcTransport {
             Arc<RTCDataChannel>,
             mpsc::Sender<Vec<u8>>,
             mpsc::Receiver<Vec<u8>>,
+            Arc<tokio::net::UdpSocket>,
+            SocketAddr,
+            tokio::sync::mpsc::Receiver<Vec<u8>>,
         ),
         WebRtcError,
     > {
@@ -454,7 +478,7 @@ impl WebRtcTransport {
         // Create UDP connection to relay. All packets (STUN, DTLS, SCTP) are
         // forwarded directly — the relay handles STUN Binding authentication using
         // the credentials we put in the SDP (ice-ufrag=auth_token, ice-pwd=relay_key).
-        let relay_conn = RelayUdpConn::new(relay_addr).await.map_err(|e| {
+        let mut relay_conn = RelayUdpConn::new(relay_addr).await.map_err(|e| {
             warn!("Failed to create relay connection: {}", e);
             WebRtcError::ConnectionFailed
         })?;
@@ -486,6 +510,14 @@ impl WebRtcTransport {
                 warn!("Relay {} probe error: {}", relay_info.relay_name, e);
             }
         }
+
+        // Save shared socket reference BEFORE UDPMux takes ownership
+        let shared_socket = relay_conn.socket_arc();
+        let shared_relay_addr = relay_conn.remote_addr();
+
+        // Set up interceptor for incoming STUN responses and RTP/SRTP
+        let (interceptor_tx, interceptor_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(2048);
+        relay_conn.set_interceptor(interceptor_tx);
 
         // Create UDPMux with our relay connection
         let udp_mux = UDPMuxDefault::new(UDPMuxParams::new(relay_conn));
@@ -683,7 +715,7 @@ impl WebRtcTransport {
         tokio::select! {
             _ = open_rx => {
                 info!("DataChannel opened successfully for relay {}", relay_info.relay_name);
-                Ok((relay_info, peer_connection, data_channel, tx, rx))
+                Ok((relay_info, peer_connection, data_channel, tx, rx, shared_socket, shared_relay_addr, interceptor_rx))
             }
             _ = ice_failed_rx => {
                 warn!("ICE connection failed for relay {}", relay_info.relay_name);
@@ -910,6 +942,34 @@ impl WebRtcTransport {
         );
 
         Ok(all_relays)
+    }
+
+    /// Send raw data to the relay on the underlying UDP socket (bypassing DTLS/SCTP).
+    /// Used for STUN binding requests with sender subscriptions at the relay STUN layer.
+    pub async fn send_raw_to_relay(&self, data: &[u8]) -> Result<usize, WebRtcError> {
+        let socket = self.relay_socket.lock().await;
+        let addr = self.relay_addr.lock().await;
+        let socket = socket.as_ref().ok_or(WebRtcError::NotConnected)?;
+        let addr = addr.ok_or(WebRtcError::NotConnected)?;
+        let sent = socket.send_to(data, addr).await.map_err(|_| WebRtcError::ConnectionFailed)?;
+        debug!("Sent {} bytes raw to relay {}", sent, addr);
+        Ok(sent)
+    }
+
+    /// Check if raw UDP socket is available.
+    pub async fn has_raw_socket(&self) -> bool {
+        self.relay_socket.lock().await.is_some()
+    }
+
+    /// Receive an intercepted packet (STUN response or RTP/SRTP) from the shared UDP socket.
+    pub async fn recv_intercepted_timeout(&self, timeout_dur: Duration) -> Result<Vec<u8>, WebRtcError> {
+        let mut rx = self.interceptor_rx.lock().await;
+        let rx = rx.as_mut().ok_or(WebRtcError::NotConnected)?;
+        match tokio::time::timeout(timeout_dur, rx.recv()).await {
+            Ok(Some(data)) => Ok(data),
+            Ok(None) => Err(WebRtcError::ConnectionClosed),
+            Err(_) => Err(WebRtcError::Timeout),
+        }
     }
 
     /// Send data through the DataChannel.

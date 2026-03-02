@@ -19,7 +19,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use log::{debug, info, trace, warn};
 use tokio::net::UdpSocket;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 use webrtc::util;
 
 /// Classify a packet by its first byte for logging.
@@ -61,6 +61,9 @@ pub struct RelayUdpConn {
     /// Packet counters for summary logging.
     sent_count: AtomicU64,
     recv_count: AtomicU64,
+    /// Optional interceptor: receives copies of incoming non-DTLS packets
+    /// (STUN responses and SRTP/RTP) for application-level processing.
+    interceptor_tx: Option<mpsc::Sender<Vec<u8>>>,
 }
 
 impl RelayUdpConn {
@@ -87,6 +90,7 @@ impl RelayUdpConn {
             closed: Arc::new(Mutex::new(false)),
             sent_count: AtomicU64::new(0),
             recv_count: AtomicU64::new(0),
+            interceptor_tx: None,
         })
     }
 
@@ -103,6 +107,19 @@ impl RelayUdpConn {
     /// Get a reference to the underlying socket (for pre-flight checks before UDPMux takes over).
     pub fn socket(&self) -> &UdpSocket {
         &self.socket
+    }
+
+    /// Get a clone of the underlying socket Arc.
+    /// Call this BEFORE passing to UDPMux to keep a shared reference.
+    pub fn socket_arc(&self) -> Arc<UdpSocket> {
+        self.socket.clone()
+    }
+
+    /// Set an interceptor channel that receives copies of non-DTLS incoming packets.
+    /// STUN responses (first byte 0-3) and RTP/SRTP packets (first byte 128-191)
+    /// are forwarded to this channel for application-level processing.
+    pub fn set_interceptor(&mut self, tx: mpsc::Sender<Vec<u8>>) {
+        self.interceptor_tx = Some(tx);
     }
 
     /// Send a bare STUN Binding Request to test relay reachability.
@@ -233,12 +250,31 @@ impl util::Conn for RelayUdpConn {
     async fn recv(&self, buf: &mut [u8]) -> util::Result<usize> {
         let (len, from) = self.socket.recv_from(buf).await?;
         self.log_recv(&buf[..len], from);
+
+        // Intercept non-DTLS packets (STUN responses and RTP/SRTP)
+        if let Some(ref tx) = self.interceptor_tx {
+            let first = buf.get(0).copied().unwrap_or(0);
+            // STUN (0-3) or RTP/SRTP (128-191) — skip DTLS (20-63) which WebRTC handles
+            if first <= 3 || first >= 128 {
+                let _ = tx.try_send(buf[..len].to_vec());
+            }
+        }
+
         Ok(len)
     }
 
     async fn recv_from(&self, buf: &mut [u8]) -> util::Result<(usize, SocketAddr)> {
         let (len, from) = self.socket.recv_from(buf).await?;
         self.log_recv(&buf[..len], from);
+
+        // Intercept non-DTLS packets (STUN responses and RTP/SRTP)
+        if let Some(ref tx) = self.interceptor_tx {
+            let first = buf.get(0).copied().unwrap_or(0);
+            if first <= 3 || first >= 128 {
+                let _ = tx.try_send(buf[..len].to_vec());
+            }
+        }
+
         Ok((len, from))
     }
 
