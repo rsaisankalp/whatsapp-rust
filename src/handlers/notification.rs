@@ -100,19 +100,9 @@ async fn handle_notification_impl(client: &Arc<Client>, node: &Node) {
             handle_business_notification(client, node).await;
         }
         "privacy_token" => {
-            // Privacy token notification (WhatsApp Web: WAWebHandlePrivacyTokensNotification)
-            // Contains trusted contact tokens used for profile pic privacy and phone number privacy.
-            // Structure: <tokens><token type="trusted_contact" t="timestamp">bytes</token></tokens>
+            // Handle incoming trusted contact privacy token notifications.
+            // Matches WhatsApp Web's WAWebHandlePrivacyTokenNotification.
             handle_privacy_token_notification(client, node).await;
-        }
-        "w:gp2" => {
-            // Group notification (participant changes, subject changes, etc.)
-            // These are informational - we already handle group operations via IQ.
-            debug!("Received group notification (w:gp2) - acknowledged");
-        }
-        "status" => {
-            // Status (stories) notification - status updates posted by contacts.
-            debug!("Received status notification - acknowledged");
         }
         _ => {
             warn!("TODO: Implement handler for <notification type='{notification_type}'>");
@@ -322,102 +312,119 @@ async fn handle_account_sync_devices(client: &Arc<Client>, node: &Node, devices_
     }
 }
 
-/// Handle privacy token notification (WhatsApp Web: `WAWebHandlePrivacyTokensNotification`).
+/// Handle incoming privacy_token notification.
 ///
-/// Privacy token notifications contain trusted contact tokens used for:
-/// - Profile picture privacy (hiding profile pics from non-contacts)
-/// - Phone number privacy in calls
-/// - Spam reporting with privacy context
+/// Stores trusted contact tokens from contacts. Matches WhatsApp Web's
+/// `WAWebHandlePrivacyTokenNotification`.
 ///
 /// Structure:
 /// ```xml
-/// <notification type="privacy_token" from="user@s.whatsapp.net" sender_lid="...@lid">
+/// <notification type="privacy_token" from="user@s.whatsapp.net" sender_lid="user@lid">
 ///   <tokens>
-///     <token type="trusted_contact" t="1234567890"><!-- binary tcToken --></token>
+///     <token type="trusted_contact" t="1707000000"><!-- bytes --></token>
 ///   </tokens>
 /// </notification>
 /// ```
 async fn handle_privacy_token_notification(client: &Arc<Client>, node: &Node) {
-    let from = node.attrs().optional_string("from").unwrap_or("<unknown>");
+    use wacore::iq::tctoken::parse_privacy_token_notification;
+    use wacore::store::traits::TcTokenEntry;
 
-    let Some(tokens_node) = node.get_optional_child_by_tag(&["tokens"]) else {
-        debug!(
-            target: "Client/PrivacyToken",
-            "privacy_token notification from {} has no <tokens> child",
-            from
-        );
-        return;
-    };
+    // Resolve the sender to a LID JID for storage.
+    // WA Web uses `sender_lid` attr if present, otherwise resolves from `from`.
+    let sender_lid = node
+        .attrs()
+        .optional_jid("sender_lid")
+        .map(|j| j.user.clone());
 
-    let Some(children) = tokens_node.children() else {
-        debug!(
-            target: "Client/PrivacyToken",
-            "privacy_token notification from {} has empty <tokens>",
-            from
-        );
-        return;
-    };
+    let sender_lid = match sender_lid {
+        Some(lid) if !lid.is_empty() => lid,
+        _ => {
+            // Fall back to resolving from the `from` JID via LID-PN cache
+            let from_jid = match node.attrs().optional_jid("from") {
+                Some(jid) => jid,
+                None => {
+                    warn!(target: "Client/TcToken", "privacy_token notification missing 'from' attribute");
+                    return;
+                }
+            };
 
-    for token_node in children.iter().filter(|c| c.tag == "token") {
-        let token_type = token_node
-            .attrs()
-            .optional_string("type")
-            .unwrap_or("unknown");
-        let timestamp = token_node.attrs().optional_u64("t").unwrap_or(0);
-
-        match token_type {
-            "trusted_contact" => {
-                let token_bytes = match token_node.content.as_ref() {
-                    Some(wacore_binary::node::NodeContent::Bytes(b)) => Some(b.clone()),
-                    Some(wacore_binary::node::NodeContent::String(s)) => {
-                        use base64::Engine as _;
-                        base64::engine::general_purpose::STANDARD
-                            .decode(s)
-                            .ok()
-                            .or_else(|| Some(s.as_bytes().to_vec()))
+            if from_jid.is_lid() {
+                from_jid.user.clone()
+            } else {
+                // Try to resolve phone number to LID
+                match client.lid_pn_cache.get_current_lid(&from_jid.user).await {
+                    Some(lid) => lid,
+                    None => {
+                        debug!(
+                            target: "Client/TcToken",
+                            "Cannot resolve LID for privacy_token sender {}, storing under PN",
+                            from_jid
+                        );
+                        from_jid.user.clone()
                     }
-                    _ => None,
-                };
+                }
+            }
+        }
+    };
 
-                let Some(token_bytes) = token_bytes else {
+    // Parse the token data from the notification
+    let received_tokens = match parse_privacy_token_notification(node) {
+        Ok(tokens) => tokens,
+        Err(e) => {
+            warn!(target: "Client/TcToken", "Failed to parse privacy_token notification: {e}");
+            return;
+        }
+    };
+
+    if received_tokens.is_empty() {
+        debug!(target: "Client/TcToken", "privacy_token notification had no trusted_contact tokens");
+        return;
+    }
+
+    let backend = client.persistence_manager.backend();
+
+    for received in &received_tokens {
+        match backend.get_tc_token(&sender_lid).await {
+            Ok(Some(existing)) => {
+                // Timestamp monotonicity guard: only store if incoming >= existing
+                if received.timestamp < existing.token_timestamp {
                     debug!(
-                        target: "Client/PrivacyToken",
-                        "trusted_contact token from {} had no usable payload",
-                        from
+                        target: "Client/TcToken",
+                        "Skipping older token for {} (incoming={}, existing={})",
+                        sender_lid, received.timestamp, existing.token_timestamp
                     );
                     continue;
+                }
+
+                // Preserve existing sender_timestamp when updating token
+                let entry = TcTokenEntry {
+                    token: received.token.clone(),
+                    token_timestamp: received.timestamp,
+                    sender_timestamp: existing.sender_timestamp,
                 };
 
-                let from_jid: Jid = match from.parse() {
-                    Ok(j) => j,
-                    Err(e) => {
-                        warn!(
-                            target: "Client/PrivacyToken",
-                            "Failed parsing privacy token sender JID '{}': {}",
-                            from, e
-                        );
-                        continue;
-                    }
-                };
-
-                client
-                    .store_trusted_contact_token(&from_jid, token_bytes.clone())
-                    .await;
-
-                debug!(
-                    target: "Client/PrivacyToken",
-                    "Received trusted_contact token from {} ({} bytes, ts={})",
-                    from,
-                    token_bytes.len(),
-                    timestamp
-                );
+                if let Err(e) = backend.put_tc_token(&sender_lid, &entry).await {
+                    warn!(target: "Client/TcToken", "Failed to update tc_token for {}: {e}", sender_lid);
+                } else {
+                    debug!(target: "Client/TcToken", "Updated tc_token for {} (t={})", sender_lid, received.timestamp);
+                }
             }
-            _ => {
-                debug!(
-                    target: "Client/PrivacyToken",
-                    "Unknown privacy token type '{}' from {}",
-                    token_type, from
-                );
+            Ok(None) => {
+                // New token — no existing entry
+                let entry = TcTokenEntry {
+                    token: received.token.clone(),
+                    token_timestamp: received.timestamp,
+                    sender_timestamp: None,
+                };
+
+                if let Err(e) = backend.put_tc_token(&sender_lid, &entry).await {
+                    warn!(target: "Client/TcToken", "Failed to store tc_token for {}: {e}", sender_lid);
+                } else {
+                    debug!(target: "Client/TcToken", "Stored new tc_token for {} (t={})", sender_lid, received.timestamp);
+                }
+            }
+            Err(e) => {
+                warn!(target: "Client/TcToken", "Failed to read tc_token for {}: {e}, skipping", sender_lid);
             }
         }
     }

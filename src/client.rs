@@ -234,9 +234,26 @@ pub struct Client {
     /// Cache of trusted contact privacy tokens keyed by normalized JID string.
     /// Used when constructing call/profile privacy elements.
     pub(crate) trusted_contact_tokens: Cache<String, Vec<u8>>,
+
+    /// When true, history sync notifications are acknowledged but not downloaded
+    /// or processed. Set via `BotBuilder::skip_history_sync()`.
+    pub(crate) skip_history_sync: AtomicBool,
 }
 
 impl Client {
+    /// Enable or disable skipping of history sync notifications at runtime.
+    ///
+    /// When enabled, the client will acknowledge incoming history sync
+    /// notifications but will not download or process the data.
+    pub fn set_skip_history_sync(&self, enabled: bool) {
+        self.skip_history_sync.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Returns `true` if history sync notifications are currently being skipped.
+    pub fn skip_history_sync_enabled(&self) -> bool {
+        self.skip_history_sync.load(Ordering::Relaxed)
+    }
+
     pub async fn new(
         persistence_manager: Arc<PersistenceManager>,
         transport_factory: Arc<dyn crate::transport::TransportFactory>,
@@ -364,6 +381,8 @@ impl Client {
                 .time_to_live(Duration::from_secs(30 * 24 * 3600)) // 30 days
                 .max_capacity(20_000)
                 .build(),
+
+            skip_history_sync: AtomicBool::new(false),
         };
 
         let arc = Arc::new(this);
@@ -1281,6 +1300,11 @@ impl Client {
                 }
                 if let Err(e) = r_digest {
                     warn!("Background init: Failed to send digest: {e:?}");
+                }
+
+                // Prune expired tcTokens on connect (matches WhatsApp Web's PrivacyTokenJob)
+                if let Err(e) = bg_client.tc_token().prune_expired().await {
+                    warn!("Background init: Failed to prune expired tc_tokens: {e:?}");
                 }
             });
 
@@ -3327,22 +3351,28 @@ mod tests {
             "Initial sequence should be 0"
         );
 
-        // First prepare_send should succeed and return sequence 1 (pre-increment like WhatsApp Web)
-        let result = client.unified_session.prepare_send().await;
-        assert!(result.is_some(), "First send should succeed");
-        let (node, seq) = result.unwrap();
-        assert_eq!(node.tag, "ib", "Should be an IB stanza");
-        assert_eq!(seq, 1, "First sequence should be 1 (pre-increment)");
+        // Duplicate prevention depends on the session ID staying the same between calls.
+        // Since the session ID is millisecond-based, use a retry loop to handle
+        // the rare case where we cross a millisecond boundary between calls.
+        loop {
+            client.unified_session.reset().await;
 
-        // Sequence counter should now be 1
-        assert_eq!(client.unified_session.sequence(), 1);
+            let result = client.unified_session.prepare_send().await;
+            assert!(result.is_some(), "First send should succeed");
+            let (node, seq) = result.unwrap();
+            assert_eq!(node.tag, "ib", "Should be an IB stanza");
+            assert_eq!(seq, 1, "First sequence should be 1 (pre-increment)");
+            assert_eq!(client.unified_session.sequence(), 1);
 
-        // Second prepare_send should be blocked (duplicate prevention)
-        let result2 = client.unified_session.prepare_send().await;
-        assert!(result2.is_none(), "Duplicate should be prevented");
-
-        // Sequence should still be 1 (not incremented for duplicates)
-        assert_eq!(client.unified_session.sequence(), 1);
+            let result2 = client.unified_session.prepare_send().await;
+            if result2.is_none() {
+                // Duplicate was prevented within the same millisecond
+                assert_eq!(client.unified_session.sequence(), 1);
+                break;
+            }
+            // Millisecond boundary crossed, retry
+            tokio::task::yield_now().await;
+        }
 
         // Clear last sent and try again - sequence resets on "new" session ID
         client.unified_session.clear_last_sent().await;
