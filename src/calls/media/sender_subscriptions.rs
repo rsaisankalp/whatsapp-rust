@@ -1,7 +1,8 @@
-//! SenderSubscriptions builder for STUN 0x4000 attribute.
+//! SenderSubscriptions builder for STUN 0x4000 attribute and
+//! ReceiverSubscription for STUN 0x4001 attribute.
 //!
-//! WhatsApp uses a protobuf-encoded SenderSubscriptions message in the
-//! STUN Allocate request to tell the relay what streams we're sending.
+//! WhatsApp uses protobuf-encoded subscription messages in the
+//! STUN bind/allocate request to tell the relay what streams we send and receive.
 
 use prost::Message;
 use waproto::voip::{PayloadType, SenderSubscription, SenderSubscriptions, StreamLayer};
@@ -23,9 +24,6 @@ fn build_audio_subscription(ssrc: u32, sender_jid: Option<String>) -> Vec<u8> {
 }
 
 /// Create an app-data stream sender subscription for STUN bind/app-data v2.
-///
-/// This is used when the server advertises `app_data_stream_version=2` and
-/// `disable_ssrc_subscription=true`, where stream routing is done by stream layer.
 pub fn create_app_data_sender_subscriptions(
     pid: Option<u32>,
     sender_jid: Option<String>,
@@ -41,25 +39,62 @@ pub fn create_app_data_sender_subscriptions(
     encode_subscriptions(vec![subscription])
 }
 
+/// Create a combined sender subscription with BOTH audio + app-data in one message.
+/// This is the preferred format for a single STUN bind carrying all subscriptions.
+pub fn create_combined_sender_subscriptions(
+    ssrc: u32,
+    pid: Option<u32>,
+    sender_jid: Option<String>,
+) -> Vec<u8> {
+    let audio = SenderSubscription {
+        sender_jid: sender_jid.clone(),
+        ssrc: Some(ssrc),
+        stream_layer: Some(StreamLayer::Audio.into()),
+        payload_type: Some(PayloadType::Media.into()),
+        ..Default::default()
+    };
+    let app_data = SenderSubscription {
+        sender_jid,
+        pid,
+        stream_layer: Some(StreamLayer::AppDataStream0.into()),
+        payload_type: Some(PayloadType::AppData.into()),
+        ..Default::default()
+    };
+    encode_subscriptions(vec![audio, app_data])
+}
+
+/// Create a receiver subscription (0x4001) for audio.
+/// Tells the relay we want to RECEIVE audio from the remote side.
+pub fn create_audio_receiver_subscription() -> Vec<u8> {
+    let subscription = SenderSubscription {
+        stream_layer: Some(StreamLayer::Audio.into()),
+        payload_type: Some(PayloadType::Media.into()),
+        ..Default::default()
+    };
+    encode_subscriptions(vec![subscription])
+}
+
+/// Create a combined receiver subscription for audio + app-data.
+pub fn create_combined_receiver_subscription() -> Vec<u8> {
+    let audio = SenderSubscription {
+        stream_layer: Some(StreamLayer::Audio.into()),
+        payload_type: Some(PayloadType::Media.into()),
+        ..Default::default()
+    };
+    let app_data = SenderSubscription {
+        stream_layer: Some(StreamLayer::AppDataStream0.into()),
+        payload_type: Some(PayloadType::AppData.into()),
+        ..Default::default()
+    };
+    encode_subscriptions(vec![audio, app_data])
+}
+
 /// Create a minimal SenderSubscriptions for a 1:1 audio call.
-///
-/// # Arguments
-/// * `ssrc` - Our RTP SSRC (must match the SSRC used in RTP packets)
-///
-/// # Returns
-/// Protobuf-encoded bytes suitable for the 0x4000 STUN attribute
 pub fn create_audio_sender_subscriptions(ssrc: u32) -> Vec<u8> {
     build_audio_subscription(ssrc, None)
 }
 
 /// Create SenderSubscriptions with a device JID for multi-party calls.
-///
-/// # Arguments
-/// * `ssrc` - Our RTP SSRC
-/// * `sender_jid` - Device JID (e.g., "user@s.whatsapp.net:0")
-///
-/// # Returns
-/// Protobuf-encoded bytes suitable for the 0x4000 STUN attribute
 pub fn create_audio_sender_subscriptions_with_jid(ssrc: u32, sender_jid: String) -> Vec<u8> {
     build_audio_subscription(ssrc, Some(sender_jid))
 }

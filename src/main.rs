@@ -27,6 +27,7 @@ use whatsapp_rust::calls::media::{
     RtpSession, SRTP_AUTH_TAG_LEN, SrtpSession, StunMessage, StunMessageType,
     create_app_data_sender_subscriptions, create_audio_sender_subscriptions,
     create_audio_sender_subscriptions_with_jid,
+    create_combined_sender_subscriptions, create_combined_receiver_subscription,
 };
 use whatsapp_rust::calls::{
     AcceptAudioParams, CallManager, CallOptions, CallStanzaBuilder, EncType, SignalingType,
@@ -1368,44 +1369,68 @@ async fn start_media_automation_session(
                 }
             };
 
-            // Send via raw UDP to relay (transport-level, bypassing DTLS/SCTP)
+            let use_dc_media = env_bool("WHATSAPP_CALL_DC_MEDIA", true);
+
+            // Send via raw UDP to relay (bypassing DTLS/SCTP)
             if use_raw_media {
-                if let Err(e) = send_call_manager
+                match send_call_manager
                     .send_raw_via_webrtc(&send_call_id, &encrypted)
                     .await
                 {
-                    if sent_packets == 0 {
-                        debug!("Raw UDP media send failed for {} (will try DataChannel too): {}", send_call_id, e);
+                    Ok(_) => {
+                        if sent_packets < 3 || sent_packets % 100 == 0 {
+                            info!(
+                                "RAW UDP media #{} for {} ({} bytes SRTP)",
+                                sent_packets, send_call_id, encrypted.len()
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        if sent_packets == 0 {
+                            warn!("Raw UDP media send failed for {}: {}", send_call_id, e);
+                        }
                     }
                 }
             }
 
-            // Also send via DataChannel (DTLS/SCTP path)
-            if let Err(e) = send_call_manager
-                .send_via_webrtc(&send_call_id, &encrypted)
-                .await
-            {
-                let error_str = e.to_string().to_lowercase();
-                if error_str.contains("no webrtc transport") {
-                    info!(
-                        "Stopping send loop for {}: transport removed ({})",
-                        send_call_id, e
-                    );
-                    send_stop.store(true, Ordering::Relaxed);
-                    break;
+            // Send via DataChannel (DTLS/SCTP path)
+            if use_dc_media {
+                if let Err(e) = send_call_manager
+                    .send_via_webrtc(&send_call_id, &encrypted)
+                    .await
+                {
+                    let error_str = e.to_string().to_lowercase();
+                    if error_str.contains("no webrtc transport") {
+                        info!(
+                            "Stopping send loop for {}: transport removed ({})",
+                            send_call_id, e
+                        );
+                        send_stop.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    if sent_packets == 0 {
+                        warn!("DC media send failed for {}: {}", send_call_id, e);
+                    }
+                    if !use_raw_media {
+                        continue;
+                    }
                 }
-                if !use_raw_media {
-                    warn!("WebRTC send failed for {}: {}", send_call_id, e);
-                }
-                continue;
+            }
+
+            // If neither path is enabled, at least send via DC
+            if !use_raw_media && !use_dc_media {
+                let _ = send_call_manager.send_via_webrtc(&send_call_id, &encrypted).await;
             }
 
             sent_packets += 1;
             if sent_packets == 1 {
-                info!("First media packet sent for {} (raw_udp={}, {} bytes)", send_call_id, use_raw_media, encrypted.len());
+                info!(
+                    "First media packet sent for {} (raw={}, dc={}, {} bytes SRTP, rtp_pt={})",
+                    send_call_id, use_raw_media, use_dc_media, encrypted.len(), rtp_payload_type
+                );
             }
-            if sent_packets.is_multiple_of(200) {
-                debug!("Sent {} media packets for {}", sent_packets, send_call_id);
+            if sent_packets % 100 == 0 {
+                info!("Sent {} media packets for {} (raw={}, dc={})", sent_packets, send_call_id, use_raw_media, use_dc_media);
             }
         }
 
@@ -1485,45 +1510,89 @@ async fn start_media_automation_session(
                 break;
             }
 
-            let data = match recv_call_manager
-                .recv_from_webrtc_timeout(&recv_call_id, recv_config.recv_timeout)
-                .await
-            {
-                Ok(data) => data,
-                Err(e) => {
-                    let error_str = e.to_string().to_lowercase();
-                    if error_str.contains("no webrtc transport") {
-                        info!(
-                            "Stopping receive loop for {}: transport removed ({})",
-                            recv_call_id, e
-                        );
-                        recv_stop.store(true, Ordering::Relaxed);
-                        break;
-                    }
-                    if !error_str.contains("timeout") {
-                        debug!("Receive error for {}: {}", recv_call_id, e);
-                    }
-
-                    if !batch.is_empty() && last_flush.elapsed() >= recv_config.flush_interval {
-                        if let Err(err) = process_audio_batch(
-                            &recv_http,
-                            recv_client.clone(),
-                            &recv_config,
-                            &recv_call_id,
-                            &mut batch_seq,
-                            &mut batch,
-                            &recv_outgoing_tx,
-                        )
-                        .await
-                        {
-                            warn!(
-                                "Audio batch processing failed for {}: {}",
-                                recv_call_id, err
-                            );
+            // Check BOTH DataChannel and interceptor for incoming audio
+            let data = {
+                // First try interceptor (raw UDP RTP/SRTP from relay)
+                let intercepted = recv_call_manager
+                    .recv_intercepted_from_webrtc(&recv_call_id, Duration::from_millis(10))
+                    .await;
+                match intercepted {
+                    Ok(idata) => {
+                        let first_byte: u8 = idata.first().copied().unwrap_or(0);
+                        if first_byte >= 128 {
+                            // This is RTP/SRTP from the relay - process it directly
+                            if packet_signature_logs < recv_config.packet_signature_debug_count {
+                                info!(
+                                    "INTERCEPTED RTP #{} for {}: len={}, first8={:02x?}",
+                                    packet_signature_logs + 1,
+                                    recv_call_id,
+                                    idata.len(),
+                                    &idata[..idata.len().min(8)]
+                                );
+                            }
+                            idata
+                        } else {
+                            // STUN or other control - log but don't process as audio
+                            if packet_signature_logs < 20 {
+                                info!(
+                                    "INTERCEPTED non-RTP for {}: len={}, first_byte=0x{:02x}",
+                                    recv_call_id, idata.len(), first_byte
+                                );
+                            }
+                            // Fall through to DataChannel check
+                            match recv_call_manager
+                                .recv_from_webrtc_timeout(&recv_call_id, Duration::from_millis(50))
+                                .await
+                            {
+                                Ok(data) => data,
+                                Err(_) => continue,
+                            }
                         }
-                        last_flush = Instant::now();
                     }
-                    continue;
+                    Err(_) => {
+                        // No intercepted data, check DataChannel
+                        match recv_call_manager
+                            .recv_from_webrtc_timeout(&recv_call_id, recv_config.recv_timeout)
+                            .await
+                        {
+                            Ok(data) => data,
+                            Err(e) => {
+                                let error_str = e.to_string().to_lowercase();
+                                if error_str.contains("no webrtc transport") {
+                                    info!(
+                                        "Stopping receive loop for {}: transport removed ({})",
+                                        recv_call_id, e
+                                    );
+                                    recv_stop.store(true, Ordering::Relaxed);
+                                    break;
+                                }
+                                if !error_str.contains("timeout") {
+                                    debug!("Receive error for {}: {}", recv_call_id, e);
+                                }
+
+                                if !batch.is_empty() && last_flush.elapsed() >= recv_config.flush_interval {
+                                    if let Err(err) = process_audio_batch(
+                                        &recv_http,
+                                        recv_client.clone(),
+                                        &recv_config,
+                                        &recv_call_id,
+                                        &mut batch_seq,
+                                        &mut batch,
+                                        &recv_outgoing_tx,
+                                    )
+                                    .await
+                                    {
+                                        warn!(
+                                            "Audio batch processing failed for {}: {}",
+                                            recv_call_id, err
+                                        );
+                                    }
+                                    last_flush = Instant::now();
+                                }
+                                continue;
+                            }
+                        }
+                    }
                 }
             };
 
@@ -2055,32 +2124,45 @@ async fn perform_stun_bind_with_subscriptions(
     // Build app-data sender subscription
     let app_data_subs = create_app_data_sender_subscriptions(self_pid, sender_jid.clone());
 
-    info!(
-        "STUN Bind setup for {}: ssrc={}, self_pid={:?}, sender_jid={:?}, audio_subs={} bytes, app_data_subs={} bytes",
-        call_id, ssrc, self_pid, sender_jid, audio_subs.len(), app_data_subs.len()
+    // Build combined sender subscription (audio + app_data in one)
+    let combined_subs = create_combined_sender_subscriptions(
+        ssrc, self_pid, sender_jid.clone(),
     );
 
-    // Build STUN bind with subscriptions
-    let mut bind = StunMessage::binding_request(generate_transaction_id())
+    // Build receiver subscription (tells relay what we want to RECEIVE)
+    let receiver_subs = create_combined_receiver_subscription();
+
+    info!(
+        "STUN Bind setup for {}: ssrc={}, self_pid={:?}, sender_jid={:?}, combined_subs={} bytes, receiver_subs={} bytes",
+        call_id, ssrc, self_pid, sender_jid, combined_subs.len(), receiver_subs.len()
+    );
+
+    // Build STUN bind with BOTH sender and receiver subscriptions
+    let txn_id = generate_transaction_id();
+    let mut bind = StunMessage::binding_request(txn_id)
         .with_username(auth_token)
         .with_integrity_key(relay_key)
-        .with_priority(None)  // No ICE PRIORITY for relay bind
-        .with_sender_subscriptions(audio_subs.clone());
+        .with_priority(None)
+        .with_sender_subscriptions(combined_subs.clone())
+        .with_receiver_subscription(receiver_subs.clone());
 
     let bind_data = bind.encode();
     info!(
-        "STUN Bind for {} ({} bytes) first20={:02x?}",
+        "STUN Bind for {} ({} bytes) txn_id={:02x?} first20={:02x?}",
         call_id,
         bind_data.len(),
+        &txn_id[..],
         &bind_data[..bind_data.len().min(20)]
     );
 
+    // Track all transaction IDs we've sent so we can match responses
+    let mut sent_txn_ids: Vec<[u8; 12]> = vec![txn_id];
+
     // STRATEGY: Send STUN bind on the SHARED UDP socket (same as ICE/DTLS)
-    // This ensures the relay sees it from the same source IP:port as our authenticated connection.
     let mut shared_socket_sent = false;
     match call_manager.send_raw_via_webrtc(call_id, &bind_data).await {
         Ok(n) => {
-            info!("Sent STUN Bind on SHARED socket for {} ({} bytes) - relay will see it from same port as ICE/DTLS", call_id, n);
+            info!("Sent STUN Bind on SHARED socket for {} ({} bytes) - same port as ICE/DTLS", call_id, n);
             shared_socket_sent = true;
         }
         Err(e) => {
@@ -2088,30 +2170,34 @@ async fn perform_stun_bind_with_subscriptions(
         }
     }
 
-    // Also send via DataChannel as fallback (relay may process STUN from DataChannel too)
+    // Also send via DataChannel as fallback
     if let Err(e) = call_manager.send_via_webrtc(call_id, &bind_data).await {
         debug!("DataChannel STUN Bind send failed for {}: {}", call_id, e);
     } else {
         info!("Also sent STUN Bind via DataChannel for {} ({} bytes)", call_id, bind_data.len());
     }
 
-    // Wait for response on BOTH interceptor (raw UDP) and DataChannel
+    // Wait for response on BOTH interceptor and DataChannel
     let bind_total_ms = env_u64("WHATSAPP_CALL_STUN_BIND_TOTAL_MS", 5000);
     let bind_retry_ms = env_u64("WHATSAPP_CALL_STUN_BIND_RETRY_MS", 800).max(200);
     let mut bind_attempts = 1u32;
     let mut last_bind_send = Instant::now();
     let mut dc_msg_count = 0usize;
     let mut intercepted_count = 0usize;
+    let mut matched_bind = false;
     let start = Instant::now();
 
     while start.elapsed() < Duration::from_millis(bind_total_ms) {
         // Retry periodically
         if last_bind_send.elapsed() >= Duration::from_millis(bind_retry_ms) {
-            let retry_bind = StunMessage::binding_request(generate_transaction_id())
+            let retry_txn = generate_transaction_id();
+            sent_txn_ids.push(retry_txn);
+            let retry_bind = StunMessage::binding_request(retry_txn)
                 .with_username(auth_token)
                 .with_integrity_key(relay_key)
                 .with_priority(None)
-                .with_sender_subscriptions(audio_subs.clone());
+                .with_sender_subscriptions(combined_subs.clone())
+                .with_receiver_subscription(receiver_subs.clone());
             let retry_data = retry_bind.encode();
 
             if shared_socket_sent {
@@ -2122,36 +2208,49 @@ async fn perform_stun_bind_with_subscriptions(
             last_bind_send = Instant::now();
         }
 
-        // Check interceptor (raw UDP responses) - non-blocking
+        // Check interceptor (raw UDP responses)
         match call_manager.recv_intercepted_from_webrtc(call_id, Duration::from_millis(50)).await {
             Ok(data) => {
                 intercepted_count += 1;
                 let first_byte: u8 = data.first().copied().unwrap_or(0);
                 info!(
                     "INTERCEPTED UDP #{} for {} bind: len={}, first_byte=0x{:02x}, first20={:02x?}",
-                    intercepted_count,
-                    call_id,
-                    data.len(),
-                    first_byte,
+                    intercepted_count, call_id, data.len(), first_byte,
                     &data[..data.len().min(20)]
                 );
 
-                // Check for STUN Binding Response
                 if first_byte <= 3 {
                     if let Ok(stun) = StunMessage::decode(&data) {
+                        let txn_matches = sent_txn_ids.iter().any(|t| *t == stun.transaction_id);
                         if matches!(stun.msg_type, StunMessageType::BindingResponse) {
-                            info!("STUN Bind SUCCESS for {} via SHARED socket (intercepted)!", call_id);
-                            return Ok(());
+                            if txn_matches {
+                                info!("STUN Bind SUCCESS for {} via SHARED socket (txn matched)!", call_id);
+                                matched_bind = true;
+                                return Ok(());
+                            } else {
+                                info!(
+                                    "Intercepted BindingResponse for {} but txn_id mismatch (likely ICE consent check), ignoring",
+                                    call_id
+                                );
+                            }
                         }
                         if stun.is_error() {
                             let (code, reason) = stun.error_code().unwrap_or((0, "unknown"));
-                            warn!("STUN Bind error for {} (intercepted): code={}, reason={}", call_id, code, reason);
+                            warn!("STUN Bind error for {} (intercepted): code={}, reason={}, txn_match={}", call_id, code, reason, txn_matches);
                         }
-                        info!("Intercepted STUN msg type=0x{:04x} for {}", stun.msg_type as u16, call_id);
+                        info!("Intercepted STUN type=0x{:04x} txn_match={} for {}", stun.msg_type as u16, txn_matches, call_id);
                     }
                 }
+                // Log intercepted RTP/SRTP packets
+                if first_byte >= 128 {
+                    info!(
+                        "INTERCEPTED RTP/SRTP #{} for {}: len={}, first4={:02x?}",
+                        intercepted_count, call_id, data.len(),
+                        &data[..data.len().min(4)]
+                    );
+                }
             }
-            Err(_) => {} // timeout, check DataChannel next
+            Err(_) => {}
         }
 
         // Check DataChannel messages
@@ -2161,9 +2260,7 @@ async fn perform_stun_bind_with_subscriptions(
                 if dc_msg_count <= 50 {
                     info!(
                         "DC msg #{} for {} bind: len={}, first20={:02x?}",
-                        dc_msg_count,
-                        call_id,
-                        data.len(),
+                        dc_msg_count, call_id, data.len(),
                         &data[..data.len().min(20)]
                     );
                 }
@@ -2174,9 +2271,15 @@ async fn perform_stun_bind_with_subscriptions(
                         let _ = call_manager.send_via_webrtc(call_id, &pong).await;
                         continue;
                     }
+                    let txn_matches = sent_txn_ids.iter().any(|t| *t == stun.transaction_id);
                     if matches!(stun.msg_type, StunMessageType::BindingResponse) {
-                        info!("STUN Bind SUCCESS for {} via DataChannel!", call_id);
-                        return Ok(());
+                        if txn_matches {
+                            info!("STUN Bind SUCCESS for {} via DataChannel (txn matched)!", call_id);
+                            matched_bind = true;
+                            return Ok(());
+                        } else {
+                            info!("DC BindingResponse for {} but txn mismatch, ignoring", call_id);
+                        }
                     }
                     if stun.is_error() {
                         let (code, reason) = stun.error_code().unwrap_or((0, "unknown"));
@@ -2184,13 +2287,13 @@ async fn perform_stun_bind_with_subscriptions(
                     }
                 }
             }
-            Err(_) => {} // timeout
+            Err(_) => {}
         }
     }
 
     info!(
-        "STUN Bind phase completed for {} after {} attempts (shared_socket={}, dc_msgs={}, intercepted={}, continuing media startup)",
-        call_id, bind_attempts, shared_socket_sent, dc_msg_count, intercepted_count
+        "STUN Bind phase completed for {} after {} attempts (shared_socket={}, dc_msgs={}, intercepted={}, matched={}, continuing media startup anyway)",
+        call_id, bind_attempts, shared_socket_sent, dc_msg_count, intercepted_count, matched_bind
     );
     Ok(())
 }
