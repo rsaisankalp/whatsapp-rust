@@ -56,6 +56,16 @@ pub const WHATSAPP_DTLS_FINGERPRINT: &str = "sha-256 F9:CA:0C:98:A3:CC:71:D6:42:
 /// DataChannel name used by WhatsApp Web.
 pub const DATA_CHANNEL_NAME: &str = "wa-web-call";
 
+fn env_bool(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| {
+            let s = v.trim().to_ascii_lowercase();
+            matches!(s.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(default)
+}
+
 /// Connection state for WebRTC transport.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WebRtcState {
@@ -487,27 +497,75 @@ impl WebRtcTransport {
         let config = RTCConfiguration::default();
         let peer_connection = Arc::new(api.new_peer_connection(config).await?);
 
-        // Create the data channel (unordered for low latency, like WhatsApp Web).
-        // Use negotiated=true with id=0 to force SCTP stream 0.
-        // Chrome assigns stream 0 to the first createDataChannel() call, but
-        // webrtc-rs assigns stream 2 by default. The relay expects bidirectional
-        // data on stream 0. Using negotiated mode skips the in-band
-        // DATA_CHANNEL_OPEN/ACK exchange and binds directly to the specified stream.
+        // Default to negotiated stream 0 (current behavior), but keep a runtime
+        // fallback to non-negotiated mode for relay interoperability experiments.
+        let negotiated_stream0 = env_bool("WHATSAPP_CALL_DC_NEGOTIATED_STREAM0", true);
+        info!(
+            "DataChannel mode for {}: negotiated_stream0={}",
+            relay_info.relay_name, negotiated_stream0
+        );
+
+        let dc_init = if negotiated_stream0 {
+            webrtc::data_channel::data_channel_init::RTCDataChannelInit {
+                ordered: Some(false),
+                negotiated: Some(0),
+                ..Default::default()
+            }
+        } else {
+            webrtc::data_channel::data_channel_init::RTCDataChannelInit {
+                ordered: Some(false),
+                ..Default::default()
+            }
+        };
+
         let data_channel = peer_connection
-            .create_data_channel(
-                DATA_CHANNEL_NAME,
-                Some(
-                    webrtc::data_channel::data_channel_init::RTCDataChannelInit {
-                        ordered: Some(false),
-                        negotiated: Some(0),
-                        ..Default::default()
-                    },
-                ),
-            )
+            .create_data_channel(DATA_CHANNEL_NAME, Some(dc_init))
             .await?;
 
         // Set up the receive channel
         let (tx, rx) = mpsc::channel::<Vec<u8>>(1024);
+
+        // Capture remotely-created DataChannels too. Some clients/relays can
+        // deliver media/control over a peer-opened channel, not just our local one.
+        let tx_remote_dc = tx.clone();
+        let relay_name_for_remote_dc = relay_info.relay_name.clone();
+        peer_connection.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
+            let tx_remote_dc = tx_remote_dc.clone();
+            let relay_name = relay_name_for_remote_dc.clone();
+            Box::pin(async move {
+                info!(
+                    "Remote DataChannel discovered for relay {}: label='{}', id={}, negotiated={}",
+                    relay_name,
+                    dc.label(),
+                    dc.id(),
+                    dc.negotiated()
+                );
+
+                let tx_for_messages = tx_remote_dc.clone();
+                dc.on_message(Box::new(move |msg: DataChannelMessage| {
+                    let tx = tx_for_messages.clone();
+                    Box::pin(async move {
+                        if let Err(e) = tx.send(msg.data.to_vec()).await {
+                            warn!("Failed to forward remote DataChannel message: {}", e);
+                        }
+                    })
+                }));
+
+                let relay_name_for_open = relay_name.clone();
+                let dc_label = dc.label().to_string();
+                let dc_id = dc.id();
+                dc.on_open(Box::new(move || {
+                    let relay_name_for_open = relay_name_for_open.clone();
+                    let dc_label = dc_label.clone();
+                    Box::pin(async move {
+                        info!(
+                            "Remote DataChannel '{}' (id={}) opened for relay {}",
+                            dc_label, dc_id, relay_name_for_open
+                        );
+                    })
+                }));
+            })
+        }));
 
         // Set up data channel message handler
         let tx_clone = tx.clone();

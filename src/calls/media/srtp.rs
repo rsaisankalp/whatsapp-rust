@@ -212,14 +212,16 @@ impl SrtpContext {
         let header_size = header.size();
         let payload_len = data.len() - header_size - SRTP_AUTH_TAG_LEN;
 
-        // Update ROC and get packet index
-        self.update_roc(header.sequence_number);
-        let index = self.packet_index(header.sequence_number);
+        // Try decode using a trial context first so invalid/non-SRTP packets
+        // don't poison ROC/sequence tracking for subsequent valid packets.
+        let mut trial = self.clone();
+        trial.update_roc(header.sequence_number);
+        let index = trial.packet_index(header.sequence_number);
 
         // Verify authentication tag
         let auth_portion = &data[..data.len() - SRTP_AUTH_TAG_LEN];
         let received_tag = &data[data.len() - SRTP_AUTH_TAG_LEN..];
-        let computed_tag = self.compute_auth_tag(auth_portion, self.roc)?;
+        let computed_tag = trial.compute_auth_tag(auth_portion, trial.roc)?;
 
         if received_tag != computed_tag.as_slice() {
             return Err(SrtpError::AuthenticationFailed);
@@ -227,11 +229,13 @@ impl SrtpContext {
 
         // Decrypt payload
         let iv = self.generate_iv(header.ssrc, index);
-        let mut cipher = Aes128Ctr::new(self.session_key.as_slice().into(), iv.as_slice().into());
+        let mut cipher = Aes128Ctr::new(trial.session_key.as_slice().into(), iv.as_slice().into());
 
         let mut payload = data[header_size..header_size + payload_len].to_vec();
         cipher.apply_keystream(&mut payload);
 
+        // Commit state only after successful authentication/decryption.
+        *self = trial;
         Ok(RtpPacket::new(header, payload))
     }
 

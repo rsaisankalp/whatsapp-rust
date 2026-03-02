@@ -348,6 +348,39 @@ impl CallHandler {
             warn!("Failed to handle accept for {}: {}", parsed.call_id, e);
         }
 
+        // Keep transport signaling aligned with peer-selected network medium.
+        if let Some(net_medium) = parsed.net_medium {
+            let call_id = CallId::new(&parsed.call_id);
+            let transport_params = TransportParams {
+                p2p_cand_round: Some(0),
+                transport_message_type: Some(0),
+                net_protocol: 0,
+                net_medium,
+            };
+            match call_manager
+                .send_transport(&call_id, transport_params)
+                .await
+            {
+                Ok(transport_node) => {
+                    if let Err(e) = client.send_node(transport_node).await {
+                        warn!(
+                            "Failed sending accept transport sync for {}: {}",
+                            parsed.call_id, e
+                        );
+                    } else {
+                        debug!(
+                            "Sent accept transport sync for {} with net medium {}",
+                            parsed.call_id, net_medium
+                        );
+                    }
+                }
+                Err(e) => warn!(
+                    "Failed building accept transport sync for {}: {}",
+                    parsed.call_id, e
+                ),
+            }
+        }
+
         call_manager.notify_call_accepted(&parsed.call_id).await;
 
         client
@@ -480,7 +513,11 @@ impl CallHandler {
             .await;
     }
 
-    async fn maybe_setup_outgoing_media_on_preaccept(&self, client: &Client, parsed: &ParsedCallStanza) {
+    async fn maybe_setup_outgoing_media_on_preaccept(
+        &self,
+        client: &Client,
+        parsed: &ParsedCallStanza,
+    ) {
         let defer_outgoing_setup = std::env::var("WHATSAPP_CALL_DEFER_OUTGOING_SETUP")
             .ok()
             .map(|v| {
@@ -538,7 +575,10 @@ impl CallHandler {
                 token,
             };
 
-            match call_manager.send_relay_latency(&call_id, vec![measurement]).await {
+            match call_manager
+                .send_relay_latency(&call_id, vec![measurement])
+                .await
+            {
                 Ok(stanza) => {
                     if let Err(e) = client.send_node(stanza).await {
                         warn!(
@@ -560,10 +600,16 @@ impl CallHandler {
             net_protocol: 0,
             net_medium: 2,
         };
-        match call_manager.send_transport(&call_id, transport_params).await {
+        match call_manager
+            .send_transport(&call_id, transport_params)
+            .await
+        {
             Ok(transport_node) => {
                 if let Err(e) = client.send_node(transport_node).await {
-                    warn!("Failed to send preaccept transport for {}: {}", parsed.call_id, e);
+                    warn!(
+                        "Failed to send preaccept transport for {}: {}",
+                        parsed.call_id, e
+                    );
                 }
             }
             Err(e) => warn!(

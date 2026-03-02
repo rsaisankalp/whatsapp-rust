@@ -331,6 +331,18 @@ impl StunMessage {
         self
     }
 
+    /// Add a REALM attribute.
+    pub fn with_realm(mut self, realm: impl Into<String>) -> Self {
+        self.attributes.push(StunAttribute::Realm(realm.into()));
+        self
+    }
+
+    /// Add a NONCE attribute.
+    pub fn with_nonce(mut self, nonce: Vec<u8>) -> Self {
+        self.attributes.push(StunAttribute::Nonce(nonce));
+        self
+    }
+
     /// Set the password for MESSAGE-INTEGRITY (relay_key - ice-pwd).
     ///
     /// When set, the encoded message will include a MESSAGE-INTEGRITY attribute

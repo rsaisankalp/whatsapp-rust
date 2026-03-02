@@ -6,6 +6,7 @@ use super::encryption::EncType;
 use super::error::CallError;
 use super::signaling::SignalingType;
 use chrono::{DateTime, TimeZone, Utc};
+use serde_json::Value;
 use std::collections::HashMap;
 use wacore::types::call::{BasicCallMeta, CallMediaType, CallPlatform, CallRemoteMeta};
 use wacore_binary::builder::NodeBuilder;
@@ -128,6 +129,10 @@ pub struct RelayData {
     pub auth_tokens: Vec<Vec<u8>>,
     /// Relay endpoints from <te2> elements
     pub endpoints: Vec<RelayEndpoint>,
+    /// voip_settings.options.app_data_stream_version
+    pub app_data_stream_version: Option<u8>,
+    /// voip_settings.options.disable_ssrc_subscription
+    pub disable_ssrc_subscription: Option<bool>,
 }
 
 /// Parsed call stanza.
@@ -169,6 +174,8 @@ pub struct ParsedCallStanza {
     pub relay_data: Option<RelayData>,
     /// Media parameters from offer/accept (audio/video codec info)
     pub media_params: Option<MediaParams>,
+    /// Network medium from <net medium="..."/> in offer/accept.
+    pub net_medium: Option<u8>,
     /// Relay latency measurements from relaylatency stanzas
     pub relay_latency: Vec<RelayLatencyData>,
     /// Relay election data from relay_election stanzas
@@ -261,6 +268,11 @@ impl ParsedCallStanza {
         } else {
             None
         };
+        let net_medium = if matches!(signaling_type, SignalingType::Offer | SignalingType::Accept) {
+            Self::parse_net_medium(signaling_node)
+        } else {
+            None
+        };
 
         // Parse relay latency data from relaylatency stanzas
         let relay_latency = if signaling_type == SignalingType::RelayLatency {
@@ -299,6 +311,7 @@ impl ParsedCallStanza {
             offer_enc_data,
             relay_data,
             media_params,
+            net_medium,
             relay_latency,
             relay_election,
         })
@@ -530,6 +543,8 @@ impl ParsedCallStanza {
         }
 
         let endpoints: Vec<RelayEndpoint> = endpoints_map.into_values().collect();
+        let (app_data_stream_version, disable_ssrc_subscription) =
+            Self::parse_voip_settings_options(signaling_node);
 
         // Diagnostic logging: token inventory for debugging relay authentication
         log::info!(
@@ -565,7 +580,73 @@ impl ParsedCallStanza {
             relay_tokens,
             auth_tokens,
             endpoints,
+            app_data_stream_version,
+            disable_ssrc_subscription,
         })
+    }
+
+    fn parse_voip_settings_options(signaling_node: &Node) -> (Option<u8>, Option<bool>) {
+        let Some(children) = signaling_node.children() else {
+            return (None, None);
+        };
+
+        let Some(voip_settings) = children.iter().find(|c| c.tag == "voip_settings") else {
+            return (None, None);
+        };
+
+        let raw_json = match &voip_settings.content {
+            Some(NodeContent::String(s)) => s.clone(),
+            Some(NodeContent::Bytes(b)) => String::from_utf8_lossy(b).to_string(),
+            _ => return (None, None),
+        };
+
+        let parsed: Value = match serde_json::from_str(&raw_json) {
+            Ok(v) => v,
+            Err(e) => {
+                log::debug!("Failed parsing voip_settings JSON: {}", e);
+                return (None, None);
+            }
+        };
+
+        let options = parsed.get("options");
+        let app_data_stream_version = options
+            .and_then(|o| o.get("app_data_stream_version"))
+            .and_then(|v| {
+                if let Some(s) = v.as_str() {
+                    s.parse::<u8>().ok()
+                } else {
+                    v.as_u64().and_then(|n| u8::try_from(n).ok())
+                }
+            });
+
+        let disable_ssrc_subscription = options
+            .and_then(|o| o.get("disable_ssrc_subscription"))
+            .and_then(Self::parse_json_boolish);
+
+        if app_data_stream_version.is_some() || disable_ssrc_subscription.is_some() {
+            log::info!(
+                "Parsed voip_settings options: app_data_stream_version={:?}, disable_ssrc_subscription={:?}",
+                app_data_stream_version,
+                disable_ssrc_subscription
+            );
+        }
+
+        (app_data_stream_version, disable_ssrc_subscription)
+    }
+
+    fn parse_json_boolish(value: &Value) -> Option<bool> {
+        if let Some(b) = value.as_bool() {
+            return Some(b);
+        }
+        if let Some(s) = value.as_str() {
+            let normalized = s.trim().to_ascii_lowercase();
+            return match normalized.as_str() {
+                "1" | "true" | "yes" | "on" => Some(true),
+                "0" | "false" | "no" | "off" => Some(false),
+                _ => None,
+            };
+        }
+        value.as_i64().map(|n| n != 0)
     }
 
     fn parse_media_params(signaling_node: &Node) -> Option<MediaParams> {
@@ -599,6 +680,19 @@ impl ParsedCallStanza {
         }
 
         Some(MediaParams { audio, video })
+    }
+
+    fn parse_net_medium(signaling_node: &Node) -> Option<u8> {
+        let children = signaling_node.children()?;
+        children
+            .iter()
+            .find(|child| child.tag == "net")
+            .and_then(|net| {
+                let mut attrs = net.attrs();
+                attrs
+                    .optional_string("medium")
+                    .and_then(|medium| medium.parse::<u8>().ok())
+            })
     }
 
     fn parse_relay_latency(signaling_node: &Node) -> Vec<RelayLatencyData> {
@@ -1328,7 +1422,9 @@ impl CallStanzaBuilder {
             call_builder = call_builder.attr(k.clone(), v.clone());
         }
 
-        call_builder.children(std::iter::once(signaling_node)).build()
+        call_builder
+            .children(std::iter::once(signaling_node))
+            .build()
     }
 }
 

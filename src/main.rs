@@ -19,10 +19,13 @@ use wacore::proto_helpers::MessageExt;
 use wacore::types::call::CallId;
 use wacore::types::events::Event;
 use wacore_binary::builder::NodeBuilder;
+use wacore_binary::jid::Jid;
+use wacore_binary::node::{Node, NodeContent};
 use waproto::whatsapp as wa;
 use whatsapp_rust::bot::{Bot, MessageContext};
 use whatsapp_rust::calls::media::{
-    RtpSession, SrtpSession, StunMessage, create_audio_sender_subscriptions,
+    RtpSession, SRTP_AUTH_TAG_LEN, SrtpSession, StunMessage, create_audio_sender_subscriptions,
+    create_audio_sender_subscriptions_with_jid,
 };
 use whatsapp_rust::calls::{
     AcceptAudioParams, CallManager, CallOptions, CallStanzaBuilder, EncType, SignalingType,
@@ -34,8 +37,6 @@ use whatsapp_rust::store::SqliteStore;
 use whatsapp_rust::upload::UploadResponse;
 use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
 use whatsapp_rust_ureq_http_client::UreqHttpClient;
-use wacore_binary::jid::Jid;
-use wacore_binary::node::{Node, NodeContent};
 
 const PING_TRIGGER: &str = "🦀ping";
 const MEDIA_PING_TRIGGER: &str = "ping";
@@ -62,6 +63,8 @@ struct CallAutomationConfig {
     sample_audio_on_connect: bool,
     sample_audio_duration_ms: u64,
     sample_audio_frequency_hz: f32,
+    srtp_offset_scan: bool,
+    packet_signature_debug_count: usize,
 }
 
 impl CallAutomationConfig {
@@ -87,6 +90,8 @@ impl CallAutomationConfig {
             sample_audio_on_connect: env_bool("WHATSAPP_CALL_SAMPLE_AUDIO", true),
             sample_audio_duration_ms: env_u64("WHATSAPP_CALL_SAMPLE_AUDIO_DURATION_MS", 2000),
             sample_audio_frequency_hz: env_f32("WHATSAPP_CALL_SAMPLE_AUDIO_FREQ_HZ", 440.0),
+            srtp_offset_scan: env_bool("WHATSAPP_CALL_SRTP_OFFSET_SCAN", true),
+            packet_signature_debug_count: env_usize("WHATSAPP_CALL_PACKET_DEBUG_COUNT", 32),
         }
     }
 }
@@ -577,8 +582,14 @@ async fn start_outgoing_call_with_jid(
     if creator_mode != "manager" {
         let creator_device = client.persistence_manager().get_device_snapshot().await;
         let selected_creator = match creator_mode.as_str() {
-            "lid" => creator_device.lid.clone().or_else(|| creator_device.pn.clone()),
-            "pn" => creator_device.pn.clone().or_else(|| creator_device.lid.clone()),
+            "lid" => creator_device
+                .lid
+                .clone()
+                .or_else(|| creator_device.pn.clone()),
+            "pn" => creator_device
+                .pn
+                .clone()
+                .or_else(|| creator_device.lid.clone()),
             "lid_non_ad" => creator_device
                 .lid
                 .clone()
@@ -632,28 +643,29 @@ async fn start_outgoing_call_with_jid(
         call_id, session_target, encryption_target, has_session
     );
 
-    let (encrypted_key, device_identity) = match client.encrypt_call_key_for(&encryption_target).await {
-        Ok((call_key, encrypted)) => {
-            if let Err(e) = call_manager.store_encryption_key(&call_id, call_key).await {
-                warn!("Failed storing call key for {}: {}", call_id, e);
-            }
+    let (encrypted_key, device_identity) =
+        match client.encrypt_call_key_for(&encryption_target).await {
+            Ok((call_key, encrypted)) => {
+                if let Err(e) = call_manager.store_encryption_key(&call_id, call_key).await {
+                    warn!("Failed storing call key for {}: {}", call_id, e);
+                }
 
-            let identity = if encrypted.enc_type == EncType::PkMsg {
-                let device_snapshot = client.persistence_manager().get_device_snapshot().await;
-                device_snapshot.account.as_ref().map(|a| a.encode_to_vec())
-            } else {
-                None
-            };
-            (Some(encrypted), identity)
-        }
-        Err(e) => {
-            warn!(
-                "Call key encryption failed for {} (continuing without encrypted key): {}",
-                encryption_target, e
-            );
-            (None, None)
-        }
-    };
+                let identity = if encrypted.enc_type == EncType::PkMsg {
+                    let device_snapshot = client.persistence_manager().get_device_snapshot().await;
+                    device_snapshot.account.as_ref().map(|a| a.encode_to_vec())
+                } else {
+                    None
+                };
+                (Some(encrypted), identity)
+            }
+            Err(e) => {
+                warn!(
+                    "Call key encryption failed for {} (continuing without encrypted key): {}",
+                    encryption_target, e
+                );
+                (None, None)
+            }
+        };
 
     let offer_send_notice = env_bool("WHATSAPP_CALL_OFFER_SEND_NOTICE", false);
     let offer_stanza_id_call_id = env_bool("WHATSAPP_CALL_OFFER_STANZA_ID_CALL_ID", false);
@@ -791,9 +803,7 @@ async fn start_outgoing_call_with_jid(
         builder = builder.encrypted_key(encrypted_key);
     }
 
-    if offer_include_device_identity
-        && let Some(identity) = device_identity
-    {
+    if offer_include_device_identity && let Some(identity) = device_identity {
         builder = builder.device_identity(identity);
     }
 
@@ -904,8 +914,14 @@ async fn start_outgoing_call_with_jid(
 
     if !peer_devices.is_empty() {
         match MessageUtils::participant_list_hash(&peer_devices) {
-            Ok(local_hash) => debug!("Local computed participant hash for {}: {}", call_id, local_hash),
-            Err(e) => debug!("Failed to compute local participant hash for {}: {}", call_id, e),
+            Ok(local_hash) => debug!(
+                "Local computed participant hash for {}: {}",
+                call_id, local_hash
+            ),
+            Err(e) => debug!(
+                "Failed to compute local participant hash for {}: {}",
+                call_id, e
+            ),
         }
     }
 
@@ -991,9 +1007,7 @@ async fn resolve_call_target_jid(client: &Client, target: &str) -> Result<Jid, S
                 }
 
                 if let Some(registered) = infos.iter().find(|i| i.is_registered) {
-                    if prefer_lid
-                        && let Some(lid) = &registered.lid
-                    {
+                    if prefer_lid && let Some(lid) = &registered.lid {
                         return Ok(lid.clone());
                     }
                     return Ok(registered.jid.clone());
@@ -1019,9 +1033,7 @@ async fn resolve_call_target_jid(client: &Client, target: &str) -> Result<Jid, S
                 }
 
                 if let Some(registered) = candidates.iter().find(|c| c.is_registered) {
-                    if prefer_lid
-                        && let Some(lid) = &registered.lid
-                    {
+                    if prefer_lid && let Some(lid) = &registered.lid {
                         return Ok(lid.clone());
                     }
                     return Ok(registered.jid.clone());
@@ -1224,24 +1236,25 @@ async fn extract_relay_credentials(
     if let Some(transport) = call_manager.get_webrtc_transport(call_id).await
         && let Some(relay_info) = transport.connected_relay().await
     {
-        let auth = engine
-            .decode(&relay_info.auth_token)
-            .unwrap_or_else(|_| relay_info.auth_token.as_bytes().to_vec());
-        let key = engine
-            .decode(&relay_info.relay_key)
-            .unwrap_or_else(|_| relay_info.relay_key.as_bytes().to_vec());
-        return Ok((auth, key));
+        // STUN USERNAME / MESSAGE-INTEGRITY must use the same text credentials
+        // present in SDP ice-ufrag / ice-pwd.
+        return Ok((
+            relay_info.auth_token.as_bytes().to_vec(),
+            relay_info.relay_key.as_bytes().to_vec(),
+        ));
     }
 
     let auth = relay
         .auth_tokens
         .first()
         .cloned()
-        .ok_or_else(|| "Missing relay auth token".to_string())?;
+        .ok_or_else(|| "Missing relay auth token".to_string())
+        .map(|raw| engine.encode(raw).into_bytes())?;
     let key = relay
         .relay_key
         .clone()
-        .ok_or_else(|| "Missing relay key".to_string())?;
+        .ok_or_else(|| "Missing relay key".to_string())
+        .map(|raw| engine.encode(raw).into_bytes())?;
     Ok((auth, key))
 }
 
@@ -1266,7 +1279,24 @@ async fn start_media_automation_session(
     }
 
     let ssrc = rand::random::<u32>();
-    perform_stun_allocate(&call_manager, &call_id, &auth_token, &relay_key, ssrc).await?;
+    if env_bool("WHATSAPP_CALL_STUN_ALLOCATE", false) {
+        perform_stun_allocate(&call_manager, &call_id, &auth_token, &relay_key, ssrc).await?;
+    } else {
+        debug!(
+            "Skipping explicit STUN Allocate for {} (WHATSAPP_CALL_STUN_ALLOCATE=false)",
+            call_id_string
+        );
+        if env_bool("WHATSAPP_CALL_STUN_BIND_SUBS", true) {
+            perform_stun_bind_with_subscriptions(
+                &call_manager,
+                &call_id,
+                &auth_token,
+                &relay_key,
+                ssrc,
+            )
+            .await?;
+        }
+    }
 
     let mut master_key = [0u8; 16];
     let mut master_salt = [0u8; 14];
@@ -1279,7 +1309,19 @@ async fn start_media_automation_session(
     };
 
     let srtp_session = Arc::new(tokio::sync::Mutex::new(SrtpSession::new(&keying, &keying)));
-    let rtp_session = Arc::new(tokio::sync::Mutex::new(RtpSession::whatsapp_opus(ssrc)));
+    let rtp_payload_type = env_u64("WHATSAPP_CALL_RTP_PAYLOAD_TYPE", 120) as u8;
+    let frame_ms = env_u64("WHATSAPP_CALL_FRAME_MS", 60) as u32;
+    let samples_per_packet = ((16_000u32 * frame_ms) / 1000).max(160);
+    info!(
+        "Using RTP payload type {} for call {} (frame_ms={}, samples_per_packet={})",
+        rtp_payload_type, call_id_string, frame_ms, samples_per_packet
+    );
+    let rtp_session = Arc::new(tokio::sync::Mutex::new(RtpSession::new(
+        ssrc,
+        rtp_payload_type,
+        16_000,
+        samples_per_packet,
+    )));
 
     let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
@@ -1291,12 +1333,21 @@ async fn start_media_automation_session(
     tokio::spawn(async move {
         let mut sent_packets = 0u64;
         while !send_stop.load(Ordering::Relaxed) {
-            let frame = match tokio::time::timeout(Duration::from_millis(100), outgoing_rx.recv()).await
-            {
-                Ok(Some(frame)) => frame,
-                Ok(None) => break,
-                Err(_) => continue,
-            };
+            if !send_call_manager.has_webrtc_transport(&send_call_id).await {
+                info!(
+                    "Stopping send loop for {}: WebRTC transport no longer available",
+                    send_call_id
+                );
+                send_stop.store(true, Ordering::Relaxed);
+                break;
+            }
+
+            let frame =
+                match tokio::time::timeout(Duration::from_millis(100), outgoing_rx.recv()).await {
+                    Ok(Some(frame)) => frame,
+                    Ok(None) => break,
+                    Err(_) => continue,
+                };
 
             let rtp_packet = {
                 let mut rtp = send_rtp.lock().await;
@@ -1314,7 +1365,19 @@ async fn start_media_automation_session(
                 }
             };
 
-            if let Err(e) = send_call_manager.send_via_webrtc(&send_call_id, &encrypted).await {
+            if let Err(e) = send_call_manager
+                .send_via_webrtc(&send_call_id, &encrypted)
+                .await
+            {
+                let error_str = e.to_string().to_lowercase();
+                if error_str.contains("no webrtc transport") {
+                    info!(
+                        "Stopping send loop for {}: transport removed ({})",
+                        send_call_id, e
+                    );
+                    send_stop.store(true, Ordering::Relaxed);
+                    break;
+                }
                 warn!("WebRTC send failed for {}: {}", send_call_id, e);
                 continue;
             }
@@ -1334,6 +1397,7 @@ async fn start_media_automation_session(
         let sample_tx = outgoing_tx.clone();
         let sample_duration = config.sample_audio_duration_ms;
         let sample_freq = config.sample_audio_frequency_hz;
+        let sample_frame_ms = frame_ms;
         tokio::spawn(async move {
             // Wait for call media to stabilize before injecting the sample.
             tokio::time::sleep(Duration::from_millis(800)).await;
@@ -1341,14 +1405,15 @@ async fn start_media_automation_session(
                 return;
             }
 
-            match generate_sample_opus_frames(sample_duration, sample_freq) {
+            match generate_sample_opus_frames(sample_duration, sample_freq, sample_frame_ms) {
                 Ok(frames) => {
                     info!(
-                        "Injecting sample audio into call {} ({} frames, {}ms @ {}Hz)",
+                        "Injecting sample audio into call {} ({} frames, {}ms @ {}Hz, frame={}ms)",
                         sample_call_id,
                         frames.len(),
                         sample_duration,
-                        sample_freq
+                        sample_freq,
+                        sample_frame_ms
                     );
 
                     for frame in frames {
@@ -1358,10 +1423,13 @@ async fn start_media_automation_session(
                         if sample_tx.send(frame).is_err() {
                             break;
                         }
-                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        tokio::time::sleep(Duration::from_millis(sample_frame_ms as u64)).await;
                     }
                 }
-                Err(e) => warn!("Failed generating sample audio for {}: {}", sample_call_id, e),
+                Err(e) => warn!(
+                    "Failed generating sample audio for {}: {}",
+                    sample_call_id, e
+                ),
             }
         });
     }
@@ -1378,9 +1446,21 @@ async fn start_media_automation_session(
         let mut batch: Vec<Vec<u8>> = Vec::new();
         let mut batch_seq = 0u64;
         let mut last_flush = Instant::now();
+        let mut raw_packets = 0u64;
+        let mut stun_packets = 0u64;
         let mut received_packets = 0u64;
+        let mut packet_signature_logs = 0usize;
 
         while !recv_stop.load(Ordering::Relaxed) {
+            if !recv_call_manager.has_webrtc_transport(&recv_call_id).await {
+                info!(
+                    "Stopping receive loop for {}: WebRTC transport no longer available",
+                    recv_call_id
+                );
+                recv_stop.store(true, Ordering::Relaxed);
+                break;
+            }
+
             let data = match recv_call_manager
                 .recv_from_webrtc_timeout(&recv_call_id, recv_config.recv_timeout)
                 .await
@@ -1388,6 +1468,14 @@ async fn start_media_automation_session(
                 Ok(data) => data,
                 Err(e) => {
                     let error_str = e.to_string().to_lowercase();
+                    if error_str.contains("no webrtc transport") {
+                        info!(
+                            "Stopping receive loop for {}: transport removed ({})",
+                            recv_call_id, e
+                        );
+                        recv_stop.store(true, Ordering::Relaxed);
+                        break;
+                    }
                     if !error_str.contains("timeout") {
                         debug!("Receive error for {}: {}", recv_call_id, e);
                     }
@@ -1404,7 +1492,10 @@ async fn start_media_automation_session(
                         )
                         .await
                         {
-                            warn!("Audio batch processing failed for {}: {}", recv_call_id, err);
+                            warn!(
+                                "Audio batch processing failed for {}: {}",
+                                recv_call_id, err
+                            );
                         }
                         last_flush = Instant::now();
                     }
@@ -1412,16 +1503,83 @@ async fn start_media_automation_session(
                 }
             };
 
+            raw_packets += 1;
+            if raw_packets.is_multiple_of(200) {
+                debug!(
+                    "Received {} raw DataChannel packets for {}",
+                    raw_packets, recv_call_id
+                );
+            }
+
             if looks_like_stun(&data) {
+                stun_packets += 1;
+                if stun_packets.is_multiple_of(100) {
+                    debug!(
+                        "Received {} STUN/control packets for {}",
+                        stun_packets, recv_call_id
+                    );
+                }
                 continue;
+            }
+
+            if packet_signature_logs < recv_config.packet_signature_debug_count {
+                debug!(
+                    "Non-STUN packet #{} for {}: len={}, first16={:02x?}",
+                    packet_signature_logs + 1,
+                    recv_call_id,
+                    data.len(),
+                    &data[..data.len().min(16)]
+                );
+                packet_signature_logs += 1;
             }
 
             let packet = {
                 let mut srtp = recv_srtp.lock().await;
-                match srtp.unprotect(&data) {
-                    Ok(packet) => packet,
-                    Err(e) => {
-                        debug!("SRTP unprotect failed for {}: {}", recv_call_id, e);
+                let offsets: &[usize] = if recv_config.srtp_offset_scan {
+                    &[0, 1, 2, 4, 8]
+                } else {
+                    &[0]
+                };
+
+                let mut decoded = None;
+                let mut last_error: Option<(usize, String)> = None;
+
+                for &offset in offsets {
+                    if data.len() <= offset + 12 + SRTP_AUTH_TAG_LEN {
+                        continue;
+                    }
+
+                    match srtp.unprotect(&data[offset..]) {
+                        Ok(packet) => {
+                            if offset > 0 {
+                                debug!(
+                                    "SRTP unprotect succeeded for {} with offset {} (len={})",
+                                    recv_call_id,
+                                    offset,
+                                    data.len()
+                                );
+                            }
+                            decoded = Some(packet);
+                            break;
+                        }
+                        Err(e) => {
+                            last_error = Some((offset, e.to_string()));
+                        }
+                    }
+                }
+
+                match decoded {
+                    Some(packet) => packet,
+                    None => {
+                        if let Some((offset, err)) = last_error {
+                            debug!(
+                                "SRTP unprotect failed for {} (last offset {}, len={}): {}",
+                                recv_call_id,
+                                offset,
+                                data.len(),
+                                err
+                            );
+                        }
                         continue;
                     }
                 }
@@ -1448,7 +1606,10 @@ async fn start_media_automation_session(
                 )
                 .await
                 {
-                    warn!("Audio batch processing failed for {}: {}", recv_call_id, err);
+                    warn!(
+                        "Audio batch processing failed for {}: {}",
+                        recv_call_id, err
+                    );
                 }
                 last_flush = Instant::now();
             }
@@ -1473,7 +1634,10 @@ async fn start_media_automation_session(
             )
             .await
         {
-            warn!("Final audio batch processing failed for {}: {}", recv_call_id, err);
+            warn!(
+                "Final audio batch processing failed for {}: {}",
+                recv_call_id, err
+            );
         }
 
         info!("Receive loop stopped for call {}", recv_call_id);
@@ -1493,16 +1657,37 @@ async fn start_media_automation_session(
                 break;
             }
 
+            if !ping_call_manager.has_webrtc_transport(&ping_call_id).await {
+                info!(
+                    "Stopping ping loop for {}: WebRTC transport no longer available",
+                    ping_call_id
+                );
+                ping_stop.store(true, Ordering::Relaxed);
+                break;
+            }
+
             let ping_msg = StunMessage::whatsapp_ping(generate_transaction_id());
             let ping_data = ping_msg.encode();
-            if ping_call_manager
+            match ping_call_manager
                 .send_via_webrtc(&ping_call_id, &ping_data)
                 .await
-                .is_ok()
             {
-                sent += 1;
-                if sent.is_multiple_of(10) {
-                    debug!("Sent {} keepalive pings for {}", sent, ping_call_id);
+                Ok(()) => {
+                    sent += 1;
+                    if sent.is_multiple_of(10) {
+                        debug!("Sent {} keepalive pings for {}", sent, ping_call_id);
+                    }
+                }
+                Err(e) => {
+                    let error_str = e.to_string().to_lowercase();
+                    if error_str.contains("no webrtc transport") {
+                        info!(
+                            "Stopping ping loop for {}: transport removed ({})",
+                            ping_call_id, e
+                        );
+                        ping_stop.store(true, Ordering::Relaxed);
+                        break;
+                    }
                 }
             }
         }
@@ -1548,12 +1733,7 @@ async fn process_audio_batch(
     if let Some(reply_text) = response.reply_text.as_deref() {
         info!("🤖 {} reply: {}", call_id, reply_text);
 
-        if let Some(call_info) = client
-            .get_call_manager()
-            .await
-            .get_call_info(call_id)
-            .await
-        {
+        if let Some(call_info) = client.get_call_manager().await.get_call_info(call_id).await {
             let msg = wa::Message {
                 conversation: Some(reply_text.to_string()),
                 ..Default::default()
@@ -1639,21 +1819,56 @@ async fn perform_stun_allocate(
     relay_key: &[u8],
     ssrc: u32,
 ) -> Result<(), String> {
+    if env_bool("WHATSAPP_CALL_SKIP_STUN_ALLOCATE", true) {
+        debug!(
+            "Skipping STUN Allocate for {} (WHATSAPP_CALL_SKIP_STUN_ALLOCATE=true)",
+            call_id
+        );
+        return Ok(());
+    }
+
     let transaction_id = generate_transaction_id();
-    let sender_subscriptions = create_audio_sender_subscriptions(ssrc);
+    let include_sender_subscriptions = env_bool("WHATSAPP_CALL_STUN_SENDER_SUBS", false);
+    let sender_subscriptions = if include_sender_subscriptions {
+        if let Some(call_info) = call_manager.get_call(call_id).await {
+            let sender_jid = call_info.call_creator.to_string();
+            debug!(
+                "Using sender subscription JID {} for call {}",
+                sender_jid, call_id
+            );
+            create_audio_sender_subscriptions_with_jid(ssrc, sender_jid)
+        } else {
+            create_audio_sender_subscriptions(ssrc)
+        }
+    } else {
+        Vec::new()
+    };
 
-    let msg = StunMessage::allocate_request(transaction_id)
-        .with_username(auth_token)
-        .with_integrity_key(relay_key)
-        .with_sender_subscriptions(sender_subscriptions);
+    let build_allocate = |tx_id: [u8; 12], realm: Option<&str>, nonce: Option<&[u8]>| {
+        let mut msg = StunMessage::allocate_request(tx_id)
+            .with_username(auth_token)
+            .with_integrity_key(relay_key);
+        if include_sender_subscriptions {
+            msg = msg.with_sender_subscriptions(sender_subscriptions.clone());
+        }
+        if let Some(realm_value) = realm {
+            msg = msg.with_realm(realm_value.to_string());
+        }
+        if let Some(nonce_value) = nonce {
+            msg = msg.with_nonce(nonce_value.to_vec());
+        }
+        msg
+    };
 
+    let initial = build_allocate(transaction_id, None, None);
     call_manager
-        .send_via_webrtc(call_id, &msg.encode())
+        .send_via_webrtc(call_id, &initial.encode())
         .await
         .map_err(|e| format!("STUN Allocate send failed: {}", e))?;
 
     let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(5) {
+    let mut challenge_retried = false;
+    while start.elapsed() < Duration::from_millis(1500) {
         match call_manager
             .recv_from_webrtc_timeout(call_id, Duration::from_millis(250))
             .await
@@ -1662,11 +1877,51 @@ async fn perform_stun_allocate(
                 if data.len() < 2 {
                     continue;
                 }
-                let msg_type = ((data[0] as u16 & 0x3F) << 8) | (data[1] as u16);
-                if matches!(msg_type, 0x0103 | 0x0101) {
-                    info!("STUN Allocate successful for call {}", call_id);
-                    return Ok(());
+                if let Ok(stun) = StunMessage::decode(&data) {
+                    if stun.is_success() {
+                        info!("STUN Allocate successful for call {}", call_id);
+                        return Ok(());
+                    }
+
+                    if stun.is_error() {
+                        let (code, reason) = stun.error_code().unwrap_or((0, "unknown"));
+                        debug!(
+                            "STUN Allocate error for {}: code={} reason={}",
+                            call_id, code, reason
+                        );
+
+                        if !challenge_retried
+                            && matches!(code, 401 | 438)
+                            && let (Some(realm), Some(nonce)) = (stun.realm(), stun.nonce())
+                        {
+                            let retry_tx = generate_transaction_id();
+                            let retry = build_allocate(retry_tx, Some(realm), Some(nonce));
+                            if let Err(e) =
+                                call_manager.send_via_webrtc(call_id, &retry.encode()).await
+                            {
+                                debug!(
+                                    "STUN Allocate challenge retry send failed for {}: {}",
+                                    call_id, e
+                                );
+                            } else {
+                                debug!(
+                                    "Sent STUN Allocate challenge retry for {} (code={})",
+                                    call_id, code
+                                );
+                                challenge_retried = true;
+                            }
+                        }
+                        continue;
+                    }
                 }
+
+                let msg_type = ((data[0] as u16 & 0x3F) << 8) | (data[1] as u16);
+                debug!(
+                    "Ignoring non-allocate STUN/control response for {} (msg_type=0x{:04x}, {} bytes)",
+                    call_id,
+                    msg_type,
+                    data.len()
+                );
             }
             Err(e) => {
                 let err = e.to_string().to_lowercase();
@@ -1684,13 +1939,107 @@ async fn perform_stun_allocate(
     Ok(())
 }
 
+async fn perform_stun_bind_with_subscriptions(
+    call_manager: &Arc<CallManager>,
+    call_id: &CallId,
+    auth_token: &[u8],
+    relay_key: &[u8],
+    ssrc: u32,
+) -> Result<(), String> {
+    let relay_options = call_manager.get_relay_data(call_id).await;
+    let disable_ssrc_subscription = relay_options
+        .as_ref()
+        .and_then(|r| r.disable_ssrc_subscription)
+        .unwrap_or(false);
+    let app_data_stream_version = relay_options
+        .as_ref()
+        .and_then(|r| r.app_data_stream_version);
+
+    if let Some(version) = app_data_stream_version {
+        info!(
+            "Call {} relay voip_settings: app_data_stream_version={}",
+            call_id, version
+        );
+    }
+
+    let mut bind = StunMessage::binding_request(generate_transaction_id())
+        .with_username(auth_token)
+        .with_integrity_key(relay_key);
+
+    if disable_ssrc_subscription {
+        info!(
+            "Skipping sender subscriptions in STUN bind for {} (disable_ssrc_subscription=true)",
+            call_id
+        );
+    } else {
+        let sender_subscriptions = if let Some(call_info) = call_manager.get_call(call_id).await {
+            create_audio_sender_subscriptions_with_jid(ssrc, call_info.call_creator.to_string())
+        } else {
+            create_audio_sender_subscriptions(ssrc)
+        };
+        bind = bind.with_sender_subscriptions(sender_subscriptions);
+    }
+
+    call_manager
+        .send_via_webrtc(call_id, &bind.encode())
+        .await
+        .map_err(|e| format!("STUN Bind send failed: {}", e))?;
+
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(1200) {
+        match call_manager
+            .recv_from_webrtc_timeout(call_id, Duration::from_millis(250))
+            .await
+        {
+            Ok(data) => {
+                if let Ok(stun) = StunMessage::decode(&data) {
+                    if stun.is_success() {
+                        info!("STUN Bind successful for call {}", call_id);
+                        return Ok(());
+                    }
+                    if stun.is_error() {
+                        let (code, reason) = stun.error_code().unwrap_or((0, "unknown"));
+                        debug!(
+                            "STUN Bind error for {}: code={} reason={}",
+                            call_id, code, reason
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                let err = e.to_string().to_lowercase();
+                if !err.contains("timeout") {
+                    debug!("STUN Bind receive error for {}: {}", call_id, e);
+                }
+            }
+        }
+    }
+
+    debug!(
+        "STUN Bind timed out for {} (continuing media startup)",
+        call_id
+    );
+    Ok(())
+}
+
 fn looks_like_stun(data: &[u8]) -> bool {
-    if data.len() < 2 {
+    if data.len() < 20 {
         return false;
     }
 
-    let msg_type = ((data[0] as u16) << 8) | (data[1] as u16);
-    (data[0] & 0xC0) == 0 && msg_type < 0x4000
+    // STUN header check (RFC5389):
+    // - First 2 bits of message type are 0
+    // - Magic cookie at bytes [4..8] is 0x2112A442
+    if (data[0] & 0xC0) != 0 {
+        return false;
+    }
+    if data[4..8] != [0x21, 0x12, 0xA4, 0x42] {
+        return false;
+    }
+
+    // Attribute block length must fit in the packet and be 4-byte aligned.
+    let msg_len = u16::from_be_bytes([data[2], data[3]]) as usize;
+    msg_len % 4 == 0 && data.len() >= 20 + msg_len
 }
 
 fn generate_transaction_id() -> [u8; 12] {
@@ -1700,14 +2049,25 @@ fn generate_transaction_id() -> [u8; 12] {
     id
 }
 
-fn generate_sample_opus_frames(duration_ms: u64, frequency_hz: f32) -> Result<Vec<Vec<u8>>, String> {
+fn generate_sample_opus_frames(
+    duration_ms: u64,
+    frequency_hz: f32,
+    frame_ms: u32,
+) -> Result<Vec<Vec<u8>>, String> {
     const SAMPLE_RATE: u32 = 16_000;
-    const FRAME_SAMPLES: usize = 320; // 20ms at 16kHz
     const MAX_OPUS_SIZE: usize = 512;
     const AMPLITUDE: f32 = 0.22;
 
     if duration_ms == 0 {
         return Ok(Vec::new());
+    }
+
+    if frame_ms == 0 {
+        return Err("frame_ms must be > 0".to_string());
+    }
+    let frame_samples = ((SAMPLE_RATE as u64 * frame_ms as u64) / 1000) as usize;
+    if frame_samples == 0 {
+        return Err(format!("invalid frame_ms {}", frame_ms));
     }
 
     let mut encoder = OpusEncoder::new(SAMPLE_RATE, OpusChannels::Mono, OpusApplication::Voip)
@@ -1717,7 +2077,7 @@ fn generate_sample_opus_frames(duration_ms: u64, frequency_hz: f32) -> Result<Ve
         .map_err(|e| format!("opus set bitrate failed: {}", e))?;
 
     let total_samples = ((duration_ms as usize) * (SAMPLE_RATE as usize)) / 1000;
-    let frame_count = total_samples.div_ceil(FRAME_SAMPLES);
+    let frame_count = total_samples.div_ceil(frame_samples);
 
     let mut frames = Vec::with_capacity(frame_count);
     let mut out = vec![0u8; MAX_OPUS_SIZE];
@@ -1725,7 +2085,7 @@ fn generate_sample_opus_frames(duration_ms: u64, frequency_hz: f32) -> Result<Ve
     let phase_step = (2.0 * std::f32::consts::PI * frequency_hz) / (SAMPLE_RATE as f32);
 
     for _ in 0..frame_count {
-        let mut pcm = vec![0i16; FRAME_SAMPLES];
+        let mut pcm = vec![0i16; frame_samples];
         for sample in &mut pcm {
             let value = (phase.sin() * AMPLITUDE * (i16::MAX as f32)) as i16;
             *sample = value;

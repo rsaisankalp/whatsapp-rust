@@ -79,9 +79,15 @@ impl StanzaHandler for AckHandler {
                     .map(|v| v.to_string());
                 warn!(
                     "Offer ACK rejected: stanza_id={} call_id={} from={} error={} user_phash={:?}",
-                    node.attrs.get("id").map(|v| v.to_string()).unwrap_or_default(),
+                    node.attrs
+                        .get("id")
+                        .map(|v| v.to_string())
+                        .unwrap_or_default(),
                     ack_call_id,
-                    node.attrs.get("from").map(|v| v.to_string()).unwrap_or_default(),
+                    node.attrs
+                        .get("from")
+                        .map(|v| v.to_string())
+                        .unwrap_or_default(),
                     error_code,
                     user_phash
                 );

@@ -119,9 +119,11 @@ impl Client {
 
         for (token_jid, token, _timestamp) in &parsed {
             if let Some(token_jid) = token_jid {
-                self.store_trusted_contact_token(token_jid, token.clone()).await;
+                self.store_trusted_contact_token(token_jid, token.clone())
+                    .await;
             } else {
-                self.store_trusted_contact_token(&target, token.clone()).await;
+                self.store_trusted_contact_token(&target, token.clone())
+                    .await;
             }
         }
 

@@ -948,7 +948,11 @@ impl CallManager {
     /// Override call creator JID for an existing call.
     ///
     /// Useful when routing requires PN vs LID identity selection per call.
-    pub async fn set_call_creator(&self, call_id: &CallId, call_creator: Jid) -> Result<(), CallError> {
+    pub async fn set_call_creator(
+        &self,
+        call_id: &CallId,
+        call_creator: Jid,
+    ) -> Result<(), CallError> {
         let mut calls = self.calls.write().await;
         let info = calls
             .get_mut(call_id.as_str())

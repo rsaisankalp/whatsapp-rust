@@ -53,6 +53,8 @@ mod tests {
             relay_tokens: vec![],
             auth_tokens: vec![],
             endpoints: vec![],
+            app_data_stream_version: None,
+            disable_ssrc_subscription: None,
         }
     }
 
@@ -80,6 +82,7 @@ mod tests {
             }),
             relay_data: Some(make_relay_data()),
             media_params: Some(MediaParams::default()),
+            net_medium: None,
             relay_latency: vec![],
             relay_election: None,
         }
