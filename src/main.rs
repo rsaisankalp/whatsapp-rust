@@ -2054,162 +2054,130 @@ async fn perform_stun_allocate(
         }
     };
 
-    // Strategy 1: Allocate with auth (no subs, no fingerprint, no priority)
-    // Previous test showed: bare allocate = 451 "Hmac missing", subs = 456 "decode fail"
-    // So the relay requires auth but CANNOT handle 0x4000/0x4001 subscription attributes.
-    // Since disable_ssrc_subscription=true, subscriptions may not be needed at all.
+    // The DC STUN parser:
+    // - 28-byte bare Allocate (REQUESTED-TRANSPORT only): 451 "Hmac missing" (parsed OK!)
+    // - With USERNAME + MESSAGE-INTEGRITY: 456 "Failed to decode" (can't parse)
+    // - With 0x4000/0x4001 subscription attrs: 456 "Failed to decode"
+    //
+    // Try: MESSAGE-INTEGRITY without USERNAME (DC is DTLS-authenticated),
+    // different HMAC key formats, and attribute ordering.
+
+    let relay_key_b64 = base64::engine::general_purpose::STANDARD.encode(relay_key);
     let mut allocate_success = false;
-    {
+
+    // A: MESSAGE-INTEGRITY only (no USERNAME), HMAC key = raw relay_key
+    if !allocate_success {
         let txn = generate_transaction_id();
         let msg = StunMessage::allocate_request(txn)
             .with_fingerprint(false)
             .with_priority(None)
-            .with_username(auth_token)
             .with_integrity_key(relay_key);
         let msg_data = msg.encode();
-        info!(
-            "Strategy 1 (allocate + auth, no subs/fingerprint/priority): {} bytes, txn={:02x?}",
-            msg_data.len(),
-            &txn[..4]
-        );
-
+        info!("SA (INTEGRITY only, raw key): {} bytes", msg_data.len());
         if let Some(stun) = dc_send_and_recv(
-            call_manager.clone(),
-            call_id.clone(),
-            msg_data,
-            "S1-auth".to_string(),
-            2000,
-        )
-        .await
-        {
+            call_manager.clone(), call_id.clone(), msg_data, "SA".to_string(), 1500,
+        ).await {
             if matches!(stun.msg_type, StunMessageType::AllocateResponse) {
-                info!(
-                    "ALLOCATE SUCCESS for {}! mapped={:?}, relayed={:?}, lifetime={:?}",
-                    call_id,
-                    stun.mapped_address(),
-                    stun.relayed_address(),
-                    stun.lifetime()
-                );
-                for attr in &stun.attributes {
-                    info!("Allocate success attr: {:?}", attr);
-                }
-                allocate_success = true;
+                info!("SA SUCCESS!"); allocate_success = true;
             } else if stun.is_error() {
-                let (code, reason) = stun.error_code().unwrap_or((0, "unknown"));
-                info!("Strategy 1 error: code={}, reason='{}'", code, reason);
+                let (c, r) = stun.error_code().unwrap_or((0, "?")); info!("SA err: {}='{}'", c, r);
+            }
+        }
+    }
 
-                // Handle 401/438 challenge-response
-                if matches!(code, 401 | 438 | 451) {
-                    if let (Some(realm), Some(nonce)) = (stun.realm(), stun.nonce()) {
-                        info!(
-                            "Got {} challenge: realm='{}', nonce={} bytes - retrying with credentials",
-                            code, realm, nonce.len()
-                        );
-                        let txn2 = generate_transaction_id();
-                        let retry = StunMessage::allocate_request(txn2)
-                            .with_fingerprint(false)
-                            .with_priority(None)
-                            .with_username(auth_token)
-                            .with_integrity_key(relay_key)
-                            .with_realm(realm)
-                            .with_nonce(nonce.to_vec());
-                        if let Some(stun2) = dc_send_and_recv(
-                            call_manager.clone(),
-                            call_id.clone(),
-                            retry.encode(),
-                            "S1b-challenge".to_string(),
-                            2000,
-                        )
-                        .await
-                        {
-                            if matches!(stun2.msg_type, StunMessageType::AllocateResponse) {
-                                info!(
-                                    "ALLOCATE SUCCESS (after challenge) for {}!",
-                                    call_id
-                                );
-                                for attr in &stun2.attributes {
-                                    info!("Allocate success attr: {:?}", attr);
-                                }
-                                allocate_success = true;
-                            } else if stun2.is_error() {
-                                let (code2, reason2) =
-                                    stun2.error_code().unwrap_or((0, "unknown"));
-                                info!(
-                                    "S1b challenge retry error: code={}, reason='{}'",
-                                    code2, reason2
-                                );
-                            }
-                        }
-                    } else {
-                        // 451 without realm/nonce - try with auth directly
-                        info!("451 without challenge data, trying with USERNAME + INTEGRITY only");
-                    }
+    // B: MESSAGE-INTEGRITY only, HMAC key = base64 relay_key (24 bytes)
+    if !allocate_success {
+        let txn = generate_transaction_id();
+        let msg = StunMessage::allocate_request(txn)
+            .with_fingerprint(false)
+            .with_priority(None)
+            .with_integrity_key(relay_key_b64.as_bytes());
+        let msg_data = msg.encode();
+        info!("SB (INTEGRITY only, b64 key): {} bytes", msg_data.len());
+        if let Some(stun) = dc_send_and_recv(
+            call_manager.clone(), call_id.clone(), msg_data, "SB".to_string(), 1500,
+        ).await {
+            if matches!(stun.msg_type, StunMessageType::AllocateResponse) {
+                info!("SB SUCCESS!"); allocate_success = true;
+            } else if stun.is_error() {
+                let (c, r) = stun.error_code().unwrap_or((0, "?")); info!("SB err: {}='{}'", c, r);
+            }
+        }
+    }
+
+    // C: MESSAGE-INTEGRITY only, HMAC key = hbh_key (30 bytes, full SRTP master key+salt)
+    if !allocate_success {
+        let hbh_key = relay_options.as_ref().and_then(|r| r.hbh_key.as_ref());
+        if let Some(hbh) = hbh_key {
+            let txn = generate_transaction_id();
+            let msg = StunMessage::allocate_request(txn)
+                .with_fingerprint(false)
+                .with_priority(None)
+                .with_integrity_key(hbh);
+            let msg_data = msg.encode();
+            info!("SC (INTEGRITY only, hbh_key {} bytes): {} bytes", hbh.len(), msg_data.len());
+            if let Some(stun) = dc_send_and_recv(
+                call_manager.clone(), call_id.clone(), msg_data, "SC".to_string(), 1500,
+            ).await {
+                if matches!(stun.msg_type, StunMessageType::AllocateResponse) {
+                    info!("SC SUCCESS!"); allocate_success = true;
+                } else if stun.is_error() {
+                    let (c, r) = stun.error_code().unwrap_or((0, "?")); info!("SC err: {}='{}'", c, r);
                 }
             }
         }
     }
 
-    // Strategy 2: If allocate succeeded, send subscriptions as raw protobuf on DC
-    // (not wrapped in STUN attributes since the relay can't parse them)
-    if allocate_success {
-        info!(
-            "Allocate succeeded, sending raw protobuf subscriptions on DC for {}",
-            call_id
-        );
-        if let Err(e) = call_manager.send_via_webrtc(call_id, &combined_subs).await {
-            warn!("Raw sender subs send failed: {}", e);
-        } else {
-            info!("Sent raw sender subscriptions: {} bytes", combined_subs.len());
+    // D: REQUESTED-TRANSPORT + FINGERPRINT (no auth)
+    if !allocate_success {
+        let txn = generate_transaction_id();
+        let msg = StunMessage::allocate_request(txn)
+            .with_priority(None)
+            .with_fingerprint(true);
+        let msg_data = msg.encode();
+        info!("SD (FINGERPRINT only): {} bytes", msg_data.len());
+        if let Some(stun) = dc_send_and_recv(
+            call_manager.clone(), call_id.clone(), msg_data, "SD".to_string(), 1500,
+        ).await {
+            if matches!(stun.msg_type, StunMessageType::AllocateResponse) {
+                info!("SD SUCCESS!"); allocate_success = true;
+            } else if stun.is_error() {
+                let (c, r) = stun.error_code().unwrap_or((0, "?")); info!("SD err: {}='{}'", c, r);
+            }
         }
-        if let Err(e) = call_manager.send_via_webrtc(call_id, &receiver_subs).await {
-            warn!("Raw receiver subs send failed: {}", e);
-        } else {
-            info!(
-                "Sent raw receiver subscriptions: {} bytes",
-                receiver_subs.len()
-            );
-        }
-        return Ok(());
     }
 
-    // Strategy 3: If allocate didn't succeed, try bare allocate to see what error we get
-    {
+    // E: Full auth (USERNAME + INTEGRITY) but with b64 relay_key as HMAC
+    if !allocate_success {
         let txn = generate_transaction_id();
         let msg = StunMessage::allocate_request(txn)
             .with_fingerprint(false)
-            .with_priority(None);
+            .with_priority(None)
+            .with_username(auth_token)
+            .with_integrity_key(relay_key_b64.as_bytes());
         let msg_data = msg.encode();
-        info!(
-            "Strategy 3 (bare allocate, diagnostic): {} bytes, txn={:02x?}",
-            msg_data.len(),
-            &txn[..4]
-        );
-
+        info!("SE (USERNAME + INTEGRITY, b64 key): {} bytes", msg_data.len());
         if let Some(stun) = dc_send_and_recv(
-            call_manager.clone(),
-            call_id.clone(),
-            msg_data,
-            "S3-diag".to_string(),
-            1500,
-        )
-        .await
-        {
-            let (code, reason) = if stun.is_error() {
-                stun.error_code().unwrap_or((0, "unknown"))
-            } else {
-                (0, "success")
-            };
-            info!(
-                "S3 diagnostic result: type=0x{:04x}, code={}, reason='{}'",
-                stun.msg_type as u16, code, reason
-            );
+            call_manager.clone(), call_id.clone(), msg_data, "SE".to_string(), 1500,
+        ).await {
+            if matches!(stun.msg_type, StunMessageType::AllocateResponse) {
+                info!("SE SUCCESS!"); allocate_success = true;
+            } else if stun.is_error() {
+                let (c, r) = stun.error_code().unwrap_or((0, "?")); info!("SE err: {}='{}'", c, r);
+            }
         }
     }
 
-    warn!(
-        "DC TURN Allocate: failed for {}. Continuing without allocation.",
-        call_id
-    );
+    if allocate_success {
+        info!("Allocate succeeded for {}!", call_id);
+    } else {
+        warn!("DC TURN Allocate: all strategies failed for {}. Continuing anyway.", call_id);
+    }
+
+    // Always send raw protobuf subscriptions on DC (in case relay auto-routes)
+    let _ = call_manager.send_via_webrtc(call_id, &combined_subs).await;
+    let _ = call_manager.send_via_webrtc(call_id, &receiver_subs).await;
+    info!("Sent raw protobuf subscriptions on DC (sender={} bytes, receiver={} bytes)", combined_subs.len(), receiver_subs.len());
     Ok(())
 }
 
