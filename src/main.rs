@@ -2065,105 +2065,77 @@ async fn perform_stun_allocate(
     let relay_key_b64 = base64::engine::general_purpose::STANDARD.encode(relay_key);
     let mut allocate_success = false;
 
-    // A: MESSAGE-INTEGRITY only (no USERNAME), HMAC key = raw relay_key
-    if !allocate_success {
+    // We now know: REQUESTED-TRANSPORT + MESSAGE-INTEGRITY (no USERNAME) is parsed
+    // correctly. We get 450 "Hmac mismatch" - just need the right key.
+    //
+    // Keys tried so far: relay_key(16B), b64_relay_key(24B), hbh_key(30B) - all mismatch.
+    // New keys to try: auth_token(70B raw), b64_auth_token(96B), relay_key as SRTP key.
+
+    let auth_token_b64 = base64::engine::general_purpose::STANDARD.encode(auth_token);
+
+    // Try multiple HMAC keys - the one that matches "wins"
+    let keys_to_try: Vec<(&str, Vec<u8>)> = vec![
+        ("auth_token_raw", auth_token.to_vec()),
+        ("auth_token_b64", auth_token_b64.as_bytes().to_vec()),
+        ("relay_key_raw", relay_key.to_vec()),
+        ("relay_key_b64", relay_key_b64.as_bytes().to_vec()),
+    ];
+
+    // Also try hbh_key
+    let hbh_key = relay_options.as_ref().and_then(|r| r.hbh_key.as_ref());
+
+    for (key_name, key_data) in &keys_to_try {
+        if allocate_success {
+            break;
+        }
         let txn = generate_transaction_id();
         let msg = StunMessage::allocate_request(txn)
             .with_fingerprint(false)
             .with_priority(None)
-            .with_integrity_key(relay_key);
+            .with_integrity_key(key_data);
         let msg_data = msg.encode();
-        info!("SA (INTEGRITY only, raw key): {} bytes", msg_data.len());
+        info!("Alloc key={} ({} bytes HMAC key): msg {} bytes", key_name, key_data.len(), msg_data.len());
         if let Some(stun) = dc_send_and_recv(
-            call_manager.clone(), call_id.clone(), msg_data, "SA".to_string(), 1500,
+            call_manager.clone(), call_id.clone(), msg_data,
+            format!("K-{}", key_name), 1000,
         ).await {
             if matches!(stun.msg_type, StunMessageType::AllocateResponse) {
-                info!("SA SUCCESS!"); allocate_success = true;
+                info!("ALLOCATE SUCCESS with key={}!", key_name);
+                allocate_success = true;
             } else if stun.is_error() {
-                let (c, r) = stun.error_code().unwrap_or((0, "?")); info!("SA err: {}='{}'", c, r);
+                let (c, r) = stun.error_code().unwrap_or((0, "?"));
+                info!("Key {} → err: {}='{}'", key_name, c, r);
             }
         }
     }
 
-    // B: MESSAGE-INTEGRITY only, HMAC key = base64 relay_key (24 bytes)
+    // Also try hbh_key and SRTP key (first 16 bytes of hbh_key)
     if !allocate_success {
-        let txn = generate_transaction_id();
-        let msg = StunMessage::allocate_request(txn)
-            .with_fingerprint(false)
-            .with_priority(None)
-            .with_integrity_key(relay_key_b64.as_bytes());
-        let msg_data = msg.encode();
-        info!("SB (INTEGRITY only, b64 key): {} bytes", msg_data.len());
-        if let Some(stun) = dc_send_and_recv(
-            call_manager.clone(), call_id.clone(), msg_data, "SB".to_string(), 1500,
-        ).await {
-            if matches!(stun.msg_type, StunMessageType::AllocateResponse) {
-                info!("SB SUCCESS!"); allocate_success = true;
-            } else if stun.is_error() {
-                let (c, r) = stun.error_code().unwrap_or((0, "?")); info!("SB err: {}='{}'", c, r);
-            }
-        }
-    }
-
-    // C: MESSAGE-INTEGRITY only, HMAC key = hbh_key (30 bytes, full SRTP master key+salt)
-    if !allocate_success {
-        let hbh_key = relay_options.as_ref().and_then(|r| r.hbh_key.as_ref());
         if let Some(hbh) = hbh_key {
-            let txn = generate_transaction_id();
-            let msg = StunMessage::allocate_request(txn)
-                .with_fingerprint(false)
-                .with_priority(None)
-                .with_integrity_key(hbh);
-            let msg_data = msg.encode();
-            info!("SC (INTEGRITY only, hbh_key {} bytes): {} bytes", hbh.len(), msg_data.len());
-            if let Some(stun) = dc_send_and_recv(
-                call_manager.clone(), call_id.clone(), msg_data, "SC".to_string(), 1500,
-            ).await {
-                if matches!(stun.msg_type, StunMessageType::AllocateResponse) {
-                    info!("SC SUCCESS!"); allocate_success = true;
-                } else if stun.is_error() {
-                    let (c, r) = stun.error_code().unwrap_or((0, "?")); info!("SC err: {}='{}'", c, r);
+            for (label, key) in [
+                ("hbh_key", hbh.to_vec()),
+                ("hbh_master_16", hbh[..16.min(hbh.len())].to_vec()),
+            ] {
+                if allocate_success { break; }
+                let txn = generate_transaction_id();
+                let msg = StunMessage::allocate_request(txn)
+                    .with_fingerprint(false)
+                    .with_priority(None)
+                    .with_integrity_key(&key);
+                let msg_data = msg.encode();
+                info!("Alloc key={} ({} bytes): msg {} bytes", label, key.len(), msg_data.len());
+                if let Some(stun) = dc_send_and_recv(
+                    call_manager.clone(), call_id.clone(), msg_data,
+                    format!("K-{}", label), 1000,
+                ).await {
+                    if matches!(stun.msg_type, StunMessageType::AllocateResponse) {
+                        info!("ALLOCATE SUCCESS with key={}!", label);
+                        allocate_success = true;
+                    } else if stun.is_error() {
+                        let (c, r) = stun.error_code().unwrap_or((0, "?"));
+                        info!("Key {} → err: {}='{}'", label, c, r);
+                    }
                 }
-            }
-        }
-    }
-
-    // D: REQUESTED-TRANSPORT + FINGERPRINT (no auth)
-    if !allocate_success {
-        let txn = generate_transaction_id();
-        let msg = StunMessage::allocate_request(txn)
-            .with_priority(None)
-            .with_fingerprint(true);
-        let msg_data = msg.encode();
-        info!("SD (FINGERPRINT only): {} bytes", msg_data.len());
-        if let Some(stun) = dc_send_and_recv(
-            call_manager.clone(), call_id.clone(), msg_data, "SD".to_string(), 1500,
-        ).await {
-            if matches!(stun.msg_type, StunMessageType::AllocateResponse) {
-                info!("SD SUCCESS!"); allocate_success = true;
-            } else if stun.is_error() {
-                let (c, r) = stun.error_code().unwrap_or((0, "?")); info!("SD err: {}='{}'", c, r);
-            }
-        }
-    }
-
-    // E: Full auth (USERNAME + INTEGRITY) but with b64 relay_key as HMAC
-    if !allocate_success {
-        let txn = generate_transaction_id();
-        let msg = StunMessage::allocate_request(txn)
-            .with_fingerprint(false)
-            .with_priority(None)
-            .with_username(auth_token)
-            .with_integrity_key(relay_key_b64.as_bytes());
-        let msg_data = msg.encode();
-        info!("SE (USERNAME + INTEGRITY, b64 key): {} bytes", msg_data.len());
-        if let Some(stun) = dc_send_and_recv(
-            call_manager.clone(), call_id.clone(), msg_data, "SE".to_string(), 1500,
-        ).await {
-            if matches!(stun.msg_type, StunMessageType::AllocateResponse) {
-                info!("SE SUCCESS!"); allocate_success = true;
-            } else if stun.is_error() {
-                let (c, r) = stun.error_code().unwrap_or((0, "?")); info!("SE err: {}='{}'", c, r);
             }
         }
     }
