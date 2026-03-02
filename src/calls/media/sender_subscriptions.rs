@@ -6,6 +6,10 @@
 use prost::Message;
 use waproto::voip::{PayloadType, SenderSubscription, SenderSubscriptions, StreamLayer};
 
+fn encode_subscriptions(senders: Vec<SenderSubscription>) -> Vec<u8> {
+    SenderSubscriptions { senders }.encode_to_vec()
+}
+
 fn build_audio_subscription(ssrc: u32, sender_jid: Option<String>) -> Vec<u8> {
     let subscription = SenderSubscription {
         sender_jid,
@@ -15,10 +19,26 @@ fn build_audio_subscription(ssrc: u32, sender_jid: Option<String>) -> Vec<u8> {
         ..Default::default()
     };
 
-    SenderSubscriptions {
-        senders: vec![subscription],
-    }
-    .encode_to_vec()
+    encode_subscriptions(vec![subscription])
+}
+
+/// Create an app-data stream sender subscription for STUN bind/app-data v2.
+///
+/// This is used when the server advertises `app_data_stream_version=2` and
+/// `disable_ssrc_subscription=true`, where stream routing is done by stream layer.
+pub fn create_app_data_sender_subscriptions(
+    pid: Option<u32>,
+    sender_jid: Option<String>,
+) -> Vec<u8> {
+    let subscription = SenderSubscription {
+        sender_jid,
+        pid,
+        stream_layer: Some(StreamLayer::AppDataStream0.into()),
+        payload_type: Some(PayloadType::AppData.into()),
+        ..Default::default()
+    };
+
+    encode_subscriptions(vec![subscription])
 }
 
 /// Create a minimal SenderSubscriptions for a 1:1 audio call.
@@ -85,5 +105,22 @@ mod tests {
         assert!(data.len() < 20);
         println!("Minimal audio subscription size: {} bytes", data.len());
         println!("Encoded bytes: {:?}", data);
+    }
+
+    #[test]
+    fn test_app_data_subscription_encoding() {
+        let data = create_app_data_sender_subscriptions(Some(1), Some("12345:1@lid".to_string()));
+        let decoded = SenderSubscriptions::decode(data.as_slice()).unwrap();
+
+        assert_eq!(decoded.senders.len(), 1);
+        assert_eq!(decoded.senders[0].pid, Some(1));
+        assert_eq!(
+            decoded.senders[0].stream_layer,
+            Some(StreamLayer::AppDataStream0.into())
+        );
+        assert_eq!(
+            decoded.senders[0].payload_type,
+            Some(PayloadType::AppData.into())
+        );
     }
 }

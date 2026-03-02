@@ -4,15 +4,20 @@ Updated: March 2, 2026
 
 ## Current standing
 - Outbound call trigger is working from service startup (auto-dial).
-- Recent verified call id: `A1EC67CC7BBEF83D5AE9AB80AB58CC0F`.
-- In logs for that call we see:
+- Recent verified call id: `64B5DE395DAC191623B1B82A7FBBCB57` (Mar 2, 2026 12:16 server time).
+- In logs for this call we see:
   - offer sent + offer ACK received
   - preaccept received
   - relay connected
   - ICE connected
   - DTLS/SCTP connected
   - DataChannel `wa-web-call` opened
-- Remaining blocker: call media still intermittently ends in reconnecting/no stable bidirectional audio stream.
+- Remaining blocker: accepted calls still end in reconnecting/no stable bidirectional audio stream.
+- Current failure pattern after accept:
+  - `STUN Bind timed out ... after 10 attempts`
+  - repeated incoming control frames are only `WhatsAppPong` (20-byte)
+  - remote terminates at ~20s
+  - `nDATAs (in)` stays low (~17)
 
 ## Environment used
 File: `/etc/default/whatsapp-call-bot`
@@ -65,6 +70,12 @@ Expected indicators:
 - `Received preaccept ...`
 - `WebRTC connection established ...`
 - `DataChannel ... opened ...`
+
+Failure indicators currently seen:
+- `Using app-data sender subscription in STUN bind ...`
+- `STUN Bind timed out ...`
+- many `STUN/control packet #... type=WhatsAppPong`
+- terminate around 20s: `<terminate ... audio_duration="20xxx" .../>`
 
 ## What still needs work
 - Stabilize post-answer media path so call does not go to reconnecting.

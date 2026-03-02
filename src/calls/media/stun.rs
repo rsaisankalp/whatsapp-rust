@@ -312,6 +312,21 @@ impl StunMessage {
         }
     }
 
+    /// Create a WhatsApp Pong message (0x0802) with matching transaction ID.
+    ///
+    /// This is used to reply to relay keepalive pings.
+    pub fn whatsapp_pong(transaction_id: [u8; 12]) -> Self {
+        Self {
+            msg_type: StunMessageType::WhatsAppPong,
+            transaction_id,
+            attributes: Vec::new(),
+            integrity_key: None,
+            include_fingerprint: false,
+            ice_priority: None,
+            ice_role: None,
+        }
+    }
+
     /// Enable or disable FINGERPRINT attribute.
     pub fn with_fingerprint(mut self, include: bool) -> Self {
         self.include_fingerprint = include;

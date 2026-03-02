@@ -102,3 +102,62 @@ Service cycled repeatedly with fresh logs per experiment iteration.
 2. Verify DTLS/SRTP keying and timing against real successful session traces.
 3. Compare SCTP/DataChannel label/id/open sequence with known working Web client capture.
 4. Add targeted logs around remote relay responses to confirm whether bind is accepted or ignored.
+
+## Live Journal (Mar 2, 2026 - continued)
+
+### 11:53-11:56 EST
+- Rebuilt merged branch and restarted `whatsapp-call-bot`.
+- Verified one outbound call flow in logs with call id `A1EC67CC7BBEF83D5AE9AB80AB58CC0F`:
+  - offer + offer ACK
+  - preaccept
+  - deferred WebRTC setup success
+  - ICE connected
+  - DTLS/SCTP connected
+  - DataChannel opened
+- Issue still reported by user: reconnecting / no stable audio stream.
+
+### 11:57+ EST
+- Started new protocol-diff pass against reference projects.
+- Pulled `tulir/whatsmeow` into local workspace for comparison.
+- Next action: compare exact call signaling/bind/app-data behavior from available references and patch accordingly.
+
+### 12:00-12:10 EST - Ping/Pong + Bind Subscription Patch
+- Hypothesis: call drops around ~20s because relay keepalive pings are received but not answered.
+- Implemented:
+  - Added `StunMessage::whatsapp_pong(transaction_id)`.
+  - Receive loop now decodes STUN control packets and replies to incoming ping (0x0801) with pong (0x0802) using matching transaction ID.
+  - STUN allocate/bind wait loops also reply to ping if encountered.
+  - Tightened bind/allocate success checks to exact response types (`BindingResponse`, `AllocateResponse`) so pongs are not misclassified as success.
+  - For `disable_ssrc_subscription=true`, bind now sends app-data sender subscription (StreamLayer=APP_DATA_STREAM_0, PayloadType=APP_DATA, pid=self_pid) instead of sending no subscription.
+- Validation: `cargo check -q` passed.
+- Next: run live call and inspect if reconnecting/terminate window improves and whether STUN ping/pong counters increase.
+
+### 12:10-12:15 EST - Bind Retry + STUN Type Telemetry
+- User feedback: still reconnecting, no audible stream.
+- Added:
+  - Repeated STUN bind sends (configurable):
+    - `WHATSAPP_CALL_STUN_BIND_TOTAL_MS` (default 4000)
+    - `WHATSAPP_CALL_STUN_BIND_RETRY_MS` (default 500)
+  - Per-packet STUN type logging during bind wait (first 24 packets).
+  - Per-packet STUN/control logging during receive loop (first 40 packets).
+  - Bind timeout log now includes number of bind attempts.
+- Build validation: `cargo check -q` passed.
+
+### 12:16 EST - Fresh End-to-End Call Test After Patch Set
+- Restarted service and captured a fresh attempt (auto-dial):
+  - `systemctl restart whatsapp-call-bot`
+  - `journalctl -u whatsapp-call-bot --since '2 minutes ago' --no-pager > /tmp/wa_call_test_latest.log`
+- Tested call id: `64B5DE395DAC191623B1B82A7FBBCB57`
+- Sequence observed:
+  - offer -> offer ACK -> preaccept -> deferred WebRTC connect success (`relay=bom5c01`) -> accept
+  - app-data bind mode selected (`disable_ssrc_subscription=true`)
+  - `Sending STUN Bind ... (196 bytes)`
+  - `STUN Bind timed out ... after 10 attempts`
+  - media automation started, sample audio injected (`15000ms @ 440Hz`)
+  - repeated control frames only: `STUN/control packet #N ... type=WhatsAppPong, len=20`
+  - no successful bind response seen
+  - remote terminated at ~20.4s (`audio_duration=20448`)
+  - SCTP inbound app-data still low: `stats nDATAs (in) : 17`
+- Result:
+  - call can ring and be accepted
+  - reconnecting/no-audio failure remains unchanged in core behavior

@@ -24,7 +24,8 @@ use wacore_binary::node::{Node, NodeContent};
 use waproto::whatsapp as wa;
 use whatsapp_rust::bot::{Bot, MessageContext};
 use whatsapp_rust::calls::media::{
-    RtpSession, SRTP_AUTH_TAG_LEN, SrtpSession, StunMessage, create_audio_sender_subscriptions,
+    RtpSession, SRTP_AUTH_TAG_LEN, SrtpSession, StunMessage, StunMessageType,
+    create_app_data_sender_subscriptions, create_audio_sender_subscriptions,
     create_audio_sender_subscriptions_with_jid,
 };
 use whatsapp_rust::calls::{
@@ -1448,6 +1449,9 @@ async fn start_media_automation_session(
         let mut last_flush = Instant::now();
         let mut raw_packets = 0u64;
         let mut stun_packets = 0u64;
+        let mut stun_pings = 0u64;
+        let mut stun_pongs = 0u64;
+        let mut stun_signature_logs = 0usize;
         let mut received_packets = 0u64;
         let mut packet_signature_logs = 0usize;
 
@@ -1513,10 +1517,35 @@ async fn start_media_automation_session(
 
             if looks_like_stun(&data) {
                 stun_packets += 1;
+                if let Ok(stun) = StunMessage::decode(&data) {
+                    if stun_signature_logs < 40 {
+                        debug!(
+                            "STUN/control packet #{} for {}: type={:?}, len={}, txid={:02x?}",
+                            stun_signature_logs + 1,
+                            recv_call_id,
+                            stun.msg_type,
+                            data.len(),
+                            stun.transaction_id
+                        );
+                        stun_signature_logs += 1;
+                    }
+                    if stun.is_ping() {
+                        stun_pings += 1;
+                        let pong = StunMessage::whatsapp_pong(stun.transaction_id).encode();
+                        if let Err(e) = recv_call_manager
+                            .send_via_webrtc(&recv_call_id, &pong)
+                            .await
+                        {
+                            debug!("Failed to send STUN pong for {}: {}", recv_call_id, e);
+                        }
+                    } else if stun.is_pong() {
+                        stun_pongs += 1;
+                    }
+                }
                 if stun_packets.is_multiple_of(100) {
                     debug!(
-                        "Received {} STUN/control packets for {}",
-                        stun_packets, recv_call_id
+                        "Received {} STUN/control packets for {} (pings={}, pongs={})",
+                        stun_packets, recv_call_id, stun_pings, stun_pongs
                     );
                 }
                 continue;
@@ -1878,7 +1907,18 @@ async fn perform_stun_allocate(
                     continue;
                 }
                 if let Ok(stun) = StunMessage::decode(&data) {
-                    if stun.is_success() {
+                    if stun.is_ping() {
+                        let pong = StunMessage::whatsapp_pong(stun.transaction_id).encode();
+                        if let Err(e) = call_manager.send_via_webrtc(call_id, &pong).await {
+                            debug!(
+                                "Failed sending STUN pong for {} during allocate: {}",
+                                call_id, e
+                            );
+                        }
+                        continue;
+                    }
+
+                    if matches!(stun.msg_type, StunMessageType::AllocateResponse) {
                         info!("STUN Allocate successful for call {}", call_id);
                         return Ok(());
                     }
@@ -1911,6 +1951,11 @@ async fn perform_stun_allocate(
                                 challenge_retried = true;
                             }
                         }
+                        continue;
+                    }
+
+                    if matches!(stun.msg_type, StunMessageType::WhatsAppPong) {
+                        debug!("Received STUN pong for {} during allocate wait", call_id);
                         continue;
                     }
                 }
@@ -1965,35 +2010,86 @@ async fn perform_stun_bind_with_subscriptions(
     let mut bind = StunMessage::binding_request(generate_transaction_id())
         .with_username(auth_token)
         .with_integrity_key(relay_key);
+    let call_info = call_manager.get_call(call_id).await;
+    let sender_jid = call_info.as_ref().map(|c| c.call_creator.to_string());
+    let self_pid = relay_options.as_ref().and_then(|r| r.self_pid);
 
     if disable_ssrc_subscription {
         info!(
-            "Skipping sender subscriptions in STUN bind for {} (disable_ssrc_subscription=true)",
-            call_id
+            "Using app-data sender subscription in STUN bind for {} (disable_ssrc_subscription=true, self_pid={:?})",
+            call_id, self_pid
         );
+        let app_data_subscription =
+            create_app_data_sender_subscriptions(self_pid, sender_jid.clone());
+        bind = bind.with_sender_subscriptions(app_data_subscription);
     } else {
-        let sender_subscriptions = if let Some(call_info) = call_manager.get_call(call_id).await {
-            create_audio_sender_subscriptions_with_jid(ssrc, call_info.call_creator.to_string())
+        let sender_subscriptions = if let Some(sender_jid) = sender_jid {
+            create_audio_sender_subscriptions_with_jid(ssrc, sender_jid)
         } else {
             create_audio_sender_subscriptions(ssrc)
         };
         bind = bind.with_sender_subscriptions(sender_subscriptions);
+        debug!(
+            "Using audio sender subscription in STUN bind for {} (ssrc={})",
+            call_id, ssrc
+        );
     }
+    let bind_data = bind.encode();
+    debug!(
+        "Sending STUN Bind for {} ({} bytes)",
+        call_id,
+        bind_data.len()
+    );
 
     call_manager
-        .send_via_webrtc(call_id, &bind.encode())
+        .send_via_webrtc(call_id, &bind_data)
         .await
         .map_err(|e| format!("STUN Bind send failed: {}", e))?;
 
+    let bind_total_ms = env_u64("WHATSAPP_CALL_STUN_BIND_TOTAL_MS", 4000);
+    let bind_retry_ms = env_u64("WHATSAPP_CALL_STUN_BIND_RETRY_MS", 500).max(100);
+    let mut bind_attempts = 1u32;
+    let mut bind_stun_logs = 0usize;
+    let mut last_bind_send = Instant::now();
     let start = Instant::now();
-    while start.elapsed() < Duration::from_millis(1200) {
+    while start.elapsed() < Duration::from_millis(bind_total_ms) {
+        if last_bind_send.elapsed() >= Duration::from_millis(bind_retry_ms) {
+            if let Err(e) = call_manager.send_via_webrtc(call_id, &bind_data).await {
+                debug!("STUN Bind retry send failed for {}: {}", call_id, e);
+            } else {
+                bind_attempts = bind_attempts.saturating_add(1);
+            }
+            last_bind_send = Instant::now();
+        }
+
         match call_manager
             .recv_from_webrtc_timeout(call_id, Duration::from_millis(250))
             .await
         {
             Ok(data) => {
                 if let Ok(stun) = StunMessage::decode(&data) {
-                    if stun.is_success() {
+                    if bind_stun_logs < 24 {
+                        debug!(
+                            "STUN packet during bind for {}: type={:?}, len={}, txid={:02x?}",
+                            call_id,
+                            stun.msg_type,
+                            data.len(),
+                            stun.transaction_id
+                        );
+                        bind_stun_logs += 1;
+                    }
+                    if stun.is_ping() {
+                        let pong = StunMessage::whatsapp_pong(stun.transaction_id).encode();
+                        if let Err(e) = call_manager.send_via_webrtc(call_id, &pong).await {
+                            debug!(
+                                "Failed sending STUN pong for {} during bind: {}",
+                                call_id, e
+                            );
+                        }
+                        continue;
+                    }
+
+                    if matches!(stun.msg_type, StunMessageType::BindingResponse) {
                         info!("STUN Bind successful for call {}", call_id);
                         return Ok(());
                     }
@@ -2003,6 +2099,9 @@ async fn perform_stun_bind_with_subscriptions(
                             "STUN Bind error for {}: code={} reason={}",
                             call_id, code, reason
                         );
+                    }
+                    if matches!(stun.msg_type, StunMessageType::WhatsAppPong) {
+                        debug!("Received STUN pong for {} during bind wait", call_id);
                     }
                 }
             }
@@ -2016,8 +2115,8 @@ async fn perform_stun_bind_with_subscriptions(
     }
 
     debug!(
-        "STUN Bind timed out for {} (continuing media startup)",
-        call_id
+        "STUN Bind timed out for {} after {} attempts (continuing media startup)",
+        call_id, bind_attempts
     );
     Ok(())
 }

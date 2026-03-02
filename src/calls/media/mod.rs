@@ -60,7 +60,8 @@ pub use rtcp::{
 };
 pub use rtp::{PayloadType, RTP_VERSION, RtpHeader, RtpPacket, RtpSession};
 pub use sender_subscriptions::{
-    create_audio_sender_subscriptions, create_audio_sender_subscriptions_with_jid,
+    create_app_data_sender_subscriptions, create_audio_sender_subscriptions,
+    create_audio_sender_subscriptions_with_jid,
 };
 pub use session::{
     MediaSession, MediaSessionBuilder, MediaSessionConfig, MediaSessionError, MediaSessionState,
