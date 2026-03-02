@@ -1294,8 +1294,8 @@ async fn start_media_automation_session(
     if env_bool("WHATSAPP_CALL_STUN_ALLOCATE", false) {
         perform_stun_allocate(&call_manager, &call_id, &auth_token, &relay_key, ssrc).await?;
     } else {
-        debug!(
-            "Skipping explicit STUN Allocate for {} (WHATSAPP_CALL_STUN_ALLOCATE=false)",
+        info!(
+            "Skipping STUN Allocate for {} (WHATSAPP_CALL_STUN_ALLOCATE=false, research shows WASP relay doesn't need it)",
             call_id_string
         );
     }
@@ -1373,6 +1373,46 @@ async fn start_media_automation_session(
 
     let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
+    // Raw UDP STUN keepalive: send periodic STUN Binding Requests on the raw
+    // relay socket so the NAT mapping stays alive. The relay has a ~4s timeout.
+    if env_bool("WHATSAPP_CALL_RAW_KEEPALIVE", true) {
+        let ka_stop = stop.clone();
+        let ka_call_id = call_id.clone();
+        let ka_call_manager = call_manager.clone();
+        let ka_interval_ms = env_u64("WHATSAPP_CALL_KEEPALIVE_MS", 2000);
+        tokio::spawn(async move {
+            let mut tick = 0u64;
+            loop {
+                tokio::time::sleep(Duration::from_millis(ka_interval_ms)).await;
+                if ka_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                // Send a bare STUN Binding Request (no auth, just 20 bytes) to keep NAT open
+                let txid: [u8; 12] = rand::random();
+                let bind = StunMessage::binding_request(txid).encode();
+                match ka_call_manager
+                    .send_raw_via_webrtc(&ka_call_id, &bind)
+                    .await
+                {
+                    Ok(_) => {
+                        if tick < 3 || tick % 30 == 0 {
+                            info!(
+                                "Raw UDP keepalive #{} for {} ({} bytes)",
+                                tick, ka_call_id, bind.len()
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        if tick < 3 {
+                            warn!("Raw UDP keepalive failed for {}: {}", ka_call_id, e);
+                        }
+                    }
+                }
+                tick += 1;
+            }
+        });
+    }
+
     // Try BOTH raw UDP and DataChannel for media delivery
     let use_raw_media = env_bool("WHATSAPP_CALL_RAW_MEDIA", true);
     let send_stop = stop.clone();
@@ -1415,7 +1455,7 @@ async fn start_media_automation_session(
                 }
             };
 
-            let use_dc_media = env_bool("WHATSAPP_CALL_DC_MEDIA", true);
+            let use_dc_media = env_bool("WHATSAPP_CALL_DC_MEDIA", false);
 
             // Send via raw UDP to relay (bypassing DTLS/SCTP)
             if use_raw_media {
@@ -1545,6 +1585,10 @@ async fn start_media_automation_session(
         let mut stun_signature_logs = 0usize;
         let mut received_packets = 0u64;
         let mut packet_signature_logs = 0usize;
+        let mut intercepted_packets = 0u64;
+        let mut intercepted_rtp = 0u64;
+        let mut intercepted_stun = 0u64;
+        let mut intercepted_other = 0u64;
 
         while !recv_stop.load(Ordering::Relaxed) {
             if !recv_call_manager.has_webrtc_transport(&recv_call_id).await {
@@ -1564,25 +1608,46 @@ async fn start_media_automation_session(
                     .await;
                 match intercepted {
                     Ok(idata) => {
+                        intercepted_packets += 1;
                         let first_byte: u8 = idata.first().copied().unwrap_or(0);
                         if first_byte >= 128 {
+                            intercepted_rtp += 1;
                             // This is RTP/SRTP from the relay - process it directly
-                            if packet_signature_logs < recv_config.packet_signature_debug_count {
+                            if intercepted_rtp <= recv_config.packet_signature_debug_count as u64 {
                                 info!(
-                                    "INTERCEPTED RTP #{} for {}: len={}, first8={:02x?}",
-                                    packet_signature_logs + 1,
+                                    "INTERCEPTED RTP #{} for {}: len={}, first12={:02x?}",
+                                    intercepted_rtp,
                                     recv_call_id,
                                     idata.len(),
-                                    &idata[..idata.len().min(8)]
+                                    &idata[..idata.len().min(12)]
                                 );
                             }
                             idata
-                        } else {
-                            // STUN or other control - log but don't process as audio
-                            if packet_signature_logs < 20 {
+                        } else if first_byte <= 3 || (first_byte >= 20 && first_byte <= 63) {
+                            // STUN (0-3) or DTLS (20-63) - count and log
+                            intercepted_stun += 1;
+                            if intercepted_stun <= 20 {
                                 info!(
-                                    "INTERCEPTED non-RTP for {}: len={}, first_byte=0x{:02x}",
-                                    recv_call_id, idata.len(), first_byte
+                                    "INTERCEPTED STUN/DTLS #{} for {}: len={}, first4={:02x?}",
+                                    intercepted_stun, recv_call_id, idata.len(),
+                                    &idata[..idata.len().min(4)]
+                                );
+                            }
+                            // Fall through to DataChannel check
+                            match recv_call_manager
+                                .recv_from_webrtc_timeout(&recv_call_id, Duration::from_millis(50))
+                                .await
+                            {
+                                Ok(data) => data,
+                                Err(_) => continue,
+                            }
+                        } else {
+                            intercepted_other += 1;
+                            if intercepted_other <= 20 {
+                                info!(
+                                    "INTERCEPTED unknown #{} for {}: len={}, first8={:02x?}",
+                                    intercepted_other, recv_call_id, idata.len(),
+                                    &idata[..idata.len().min(8)]
                                 );
                             }
                             // Fall through to DataChannel check
@@ -1804,7 +1869,11 @@ async fn start_media_automation_session(
             );
         }
 
-        info!("Receive loop stopped for call {}", recv_call_id);
+        info!(
+            "Receive loop stopped for call {} | DC packets={} | STUN={} (pings={}, pongs={}) | SRTP decoded={} | Intercepted: total={} rtp={} stun={} other={}",
+            recv_call_id, raw_packets, stun_packets, stun_pings, stun_pongs,
+            received_packets, intercepted_packets, intercepted_rtp, intercepted_stun, intercepted_other
+        );
     });
 
     let ping_stop = stop.clone();
