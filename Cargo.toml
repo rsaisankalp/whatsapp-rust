@@ -48,6 +48,7 @@ hkdf = { version = "0.12.3", default-features = false }
 hmac = { version = "0.12.1", default-features = false, features = ["reset"] }
 iai-callgrind = "0.16"
 log = "0.4"
+md5 = "0.7"
 prost = { version = "0.14.1", default-features = false, features = ["std"] }
 prost-build = { version = "0.14.1", default-features = false }
 rand = "0.9"
@@ -95,6 +96,7 @@ hex = { workspace = true }
 hkdf = { workspace = true }
 hmac = "0.12.1"
 log = { workspace = true }
+md5 = { workspace = true }
 moka = { version = "0.12.12", features = ["future"] }
 opus = "0.3"
 prost = { workspace = true }
@@ -151,6 +153,7 @@ lto = false
 opt-level = 2
 
 [patch.crates-io]
+webrtc = { path = "vendor/webrtc" }
 gpui = { git = "https://github.com/jlucaso1/zed.git", branch = "gpui-yuv-surface-linux-windows", package = "gpui" }
 gpui-component = { git = "https://github.com/longbridge/gpui-component.git" }
 gpui-component-assets = { git = "https://github.com/longbridge/gpui-component.git" }

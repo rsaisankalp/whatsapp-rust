@@ -1245,6 +1245,67 @@ impl CallManager {
             .map_err(|e| CallError::Transport(format!("WebRTC recv failed: {}", e)))
     }
 
+    /// Send an Opus audio sample through the WebRTC audio track (DTLS-SRTP path).
+    pub async fn send_audio_via_webrtc(
+        &self,
+        call_id: &CallId,
+        data: bytes::Bytes,
+        duration: std::time::Duration,
+    ) -> Result<(), CallError> {
+        let transports = self.webrtc_transports.read().await;
+        let transport = transports
+            .get(call_id.as_str())
+            .ok_or_else(|| CallError::NotFound(format!("No WebRTC transport for {}", call_id)))?;
+        transport
+            .send_audio_sample(data, duration)
+            .await
+            .map_err(|e| CallError::Transport(format!("Audio send failed: {}", e)))
+    }
+
+    /// Receive incoming audio RTP payload from the WebRTC audio track.
+    pub async fn recv_audio_from_webrtc(
+        &self,
+        call_id: &CallId,
+        timeout: std::time::Duration,
+    ) -> Result<Vec<u8>, CallError> {
+        let transports = self.webrtc_transports.read().await;
+        let transport = transports
+            .get(call_id.as_str())
+            .ok_or_else(|| CallError::NotFound(format!("No WebRTC transport for {}", call_id)))?;
+        transport
+            .recv_audio_timeout(timeout)
+            .await
+            .map_err(|e| CallError::Transport(format!("Audio recv failed: {}", e)))
+    }
+
+    /// Check if the WebRTC transport has an audio track.
+    pub async fn has_audio_track(&self, call_id: &CallId) -> bool {
+        let transports = self.webrtc_transports.read().await;
+        if let Some(transport) = transports.get(call_id.as_str()) {
+            transport.has_audio_track().await
+        } else {
+            false
+        }
+    }
+
+    /// Export DTLS keying material from the WebRTC transport (RFC 5705).
+    pub async fn export_keying_material(
+        &self,
+        call_id: &CallId,
+        label: &str,
+        context: &[u8],
+        length: usize,
+    ) -> Result<Vec<u8>, CallError> {
+        let transports = self.webrtc_transports.read().await;
+        let transport = transports
+            .get(call_id.as_str())
+            .ok_or_else(|| CallError::Transport("No WebRTC transport".to_string()))?;
+        transport
+            .export_keying_material(label, context, length)
+            .await
+            .map_err(|e| CallError::Transport(format!("export_keying_material: {}", e)))
+    }
+
     /// Close the WebRTC transport for a call.
     ///
     /// This closes the DataChannel and PeerConnection, releasing all resources.

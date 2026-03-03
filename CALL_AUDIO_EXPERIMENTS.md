@@ -278,68 +278,232 @@ The HMAC key used by the relay for DC STUN Allocate authentication is most likel
 
 ---
 
-## Phase 6: Pivot - Media Path Focus (Pending)
+## Phase 6: Offer Config Fix + Pre-ICE Bind (Mar 3, ~16:50 IST)
 
-### Rationale
-The TURN Allocate on DC is a dead end without the correct HMAC key. The 7+ seconds spent trying keys is wasted. The focus should shift to the actual media transport.
+### Problem
+Calls suddenly stopped receiving offer ACK with relay data. The session target had changed from LID format (`218304664838270@lid`) to s.whatsapp.net format, with different offer config parameters.
 
-### Open Questions
-1. **Is TURN Allocate even needed?** The ICE connection is already established (ping/pong work). The WebRTC library may handle relay allocation internally.
-2. **Which media path is correct?**
-   - Raw UDP (bypasses DTLS): `send_raw_to_relay()` → sends raw SRTP on the ICE socket
-   - DataChannel: `send()` → sends through DTLS/SCTP/DataChannel
-   - Both? Neither?
-3. **Are subscriptions being registered?** We send raw protobuf via DC (`WHATSAPP_CALL_DC_PROTO_SUBS=true`) but the relay may not understand them without a proper envelope/framing.
-4. **Is the RTP payload type correct?** Currently using 111, but WhatsApp may expect a different type.
+### Root Cause
+Missing environment variables for offer config. The defaults were wrong:
+- `WHATSAPP_CALL_OFFER_SEND_NOTICE`: default=false (needed true)
+- `WHATSAPP_CALL_OFFER_NET_MEDIUM`: default=3/cellular (needed 1/WiFi)
+- `WHATSAPP_CALL_OFFER_DUAL_AUDIO`: default=true (needed false)
+- `WHATSAPP_CALL_PREFER_LID`: default=false (needed true)
 
-### Planned Experiments
-1. Disable STUN Allocate entirely (`WHATSAPP_CALL_STUN_ALLOCATE=false`)
-2. Try DC-only media (disable raw UDP): does the relay forward DataChannel binary as RTP?
-3. Try raw-UDP-only media (disable DC media): does the relay forward raw SRTP on the ICE socket?
-4. Check if the subscription protobuf needs a specific framing/header
-5. Try extracting DTLS keying material for proper TURN auth
+### Fix
+Added to `/etc/default/whatsapp-call-bot`:
+```
+WHATSAPP_CALL_PREFER_LID=true
+WHATSAPP_CALL_OFFER_SEND_NOTICE=true
+WHATSAPP_CALL_OFFER_NET_MEDIUM=1
+WHATSAPP_CALL_OFFER_DUAL_AUDIO=false
+WHATSAPP_CALL_OFFER_CAPABILITY=false
+```
+
+### Result After Fix
+- Session target correctly resolved to LID: `218304664838270@lid`
+- Offer ACK with relay data received (3 endpoints)
+- Relay probe succeeded (bom2c04 reachable)
+- Pre-ICE bind: ALL 4 strategies timed out (no response on raw UDP)
+- WebRTC/DTLS/SCTP/DataChannel connected successfully
+- Phone answered, shows "Reconnecting", no audio
+
+### Learning
+The offer config (LID preference, notice=true, net=1, dual_audio=false) is **critical** for receiving relay data. Without these, the call setup fails silently.
+
+---
+
+## Phase 7: Systematic Attribute Isolation + Derived Keys (Mar 3)
+
+### Purpose
+Systematically determine which STUN attributes the DC parser accepts/rejects, and try derived HMAC key candidates.
+
+### IMPORTANT CORRECTION to Phase 5D Capability Map
+Previous experiments concluded USERNAME and PRIORITY cause 456 (parse failure). **This was wrong!** Those 456 errors were caused by COMBINING these attributes with 0x4000/0x4001 subscription attributes. When tested INDIVIDUALLY:
+
+### Updated DC STUN Parser Capability Map
+
+| Attributes | Parseable? | Error | Phase Verified |
+|-----------|-----------|-------|----------------|
+| REQUESTED-TRANSPORT only (28B) | Yes | 451 (needs auth) | 5B |
+| REQUESTED-TRANSPORT + FINGERPRINT | Yes | 451 (needs auth) | 5B |
+| REQUESTED-TRANSPORT + MESSAGE-INTEGRITY | Yes | 450 (wrong key) | 5D |
+| REQUESTED-TRANSPORT + **USERNAME** + INTEGRITY | **Yes** | **450** (wrong key) | **7 (P3a)** |
+| REQUESTED-TRANSPORT + **FINGERPRINT** + INTEGRITY | **Yes** | **450** (wrong key) | **7 (P3b)** |
+| REQUESTED-TRANSPORT + **PRIORITY** + INTEGRITY | **Yes** | **450** (wrong key) | **7 (P3c)** |
+| REQUESTED-TRANSPORT + **SenderSubs (0x4000)** + INTEGRITY | **No** | **456** (decode fail) | **7 (P3d)** |
+| USERNAME + SenderSubs + INTEGRITY | No | 456 | 7 (P3e) |
+| Any with 0x4000/0x4001 subscription attrs | **No** | 456 (decode fail) | 7 |
+
+**KEY FINDING**: USERNAME, FINGERPRINT, and PRIORITY are ALL individually parseable. The **only** attribute that causes 456 is **SenderSubscriptions (0x4000)**!
+
+### Additional Findings
+
+**auth_token is a protobuf structure**: The decoded auth_token (70 bytes) starts with byte `0x09` which is a protobuf field tag (field 1, wire type 1 = fixed64). The DC STUN parser validates USERNAME content as protobuf.
+
+### SenderSubscriptions Format Mismatch (LIKELY CAUSE OF 456)
+
+**Desktop reference** (`whatsapp-ui/src/audio/call_media_pipeline.rs:116`):
+```rust
+let sender_subscriptions = create_audio_sender_subscriptions(ssrc);
+// → 1 subscription: {ssrc, StreamLayer::Audio, PayloadType::Media}
+// → ~12 bytes protobuf
+```
+
+**Our code** (`src/main.rs:2281`):
+```rust
+let combined_subs = create_combined_sender_subscriptions(ssrc, self_pid, sender_jid);
+// → 2 subscriptions:
+//   {ssrc, StreamLayer::Audio, PayloadType::Media, sender_jid}
+//   {pid, StreamLayer::AppDataStream0, PayloadType::AppData, sender_jid}
+// → ~67 bytes protobuf
+```
+
+**Differences**:
+- Desktop: 1 audio-only subscription, ~12 bytes, no sender_jid
+- Our code: 2 subscriptions (audio + app-data), ~67 bytes, includes sender_jid and pid
+- The extra fields/entries likely cause the 456 parse error
+
+### HMAC Key Candidates Tested (ALL fail with 450)
+
+| # | Key | Size | Source |
+|---|-----|------|--------|
+| 1 | relay_key_raw | 16B | base64-decoded relay_key |
+| 2 | auth_token_raw | 70B | base64-decoded auth_token |
+| 3 | relay_key_b64str | 24B | relay_key as string bytes |
+| 4 | hbh_key | 30B | hop-by-hop key |
+| 5 | warp_auth | 32B | HKDF-derived "warp auth key" |
+| 6 | hmac_sha1(relay_key, auth_token) | 20B | HMAC-SHA1 derivation |
+| 7 | hmac_sha1(auth_token, relay_key) | 20B | reversed HMAC-SHA1 |
+| 8 | sha1(relay_key) | 20B | simple SHA1 hash |
+| 9 | md5(auth_token:relay_key) | 16B | TURN long-term style |
+| 10 | hkdf(relay_key, "stun") | 20B | HKDF-SHA256 derivation |
+| 11-15 | DTLS export labels (Exp 3) | 20-32B | RFC 5705 keying material |
+
+**Total: 15+ key candidates, ALL produce error 450.**
+
+### Pre-ICE Allocate on Raw UDP
+- 3 attempts on raw UDP (not DataChannel), all timed out
+- The relay does not respond to STUN on raw UDP at all (neither Bind nor Allocate)
+
+---
+
+## Phase 8: Next Steps (PRIORITIZED)
+
+### Step 1: Fix SenderSubscriptions Format (HIGH PRIORITY)
+**Hypothesis**: The 0x4000 attribute causes 456 because our protobuf is wrong (67B combined with JID) vs desktop's format (12B audio-only).
+
+**Action**: In `perform_stun_allocate()`, replace:
+```rust
+let combined_subs = create_combined_sender_subscriptions(ssrc, self_pid, sender_jid.clone());
+```
+with:
+```rust
+let audio_subs = create_audio_sender_subscriptions(ssrc);
+```
+Then test the full desktop-matching STUN Allocate:
+```rust
+StunMessage::allocate_request(txn)
+    .with_username(&auth_token_raw)
+    .with_integrity_key(&relay_key_raw)
+    .with_sender_subscriptions(audio_subs)
+    // default FINGERPRINT=true, PRIORITY=DEFAULT_ICE_PRIORITY
+```
+
+**Expected**: 0x4000 should now produce 450 (parseable, wrong key) instead of 456.
+
+### Step 2: Solve the HMAC Key Problem
+If Step 1 changes 456→450, the subscription format was the issue but the HMAC key is still wrong.
+
+**Approaches to try**:
+1. **DTLS export keying material AFTER DC establishment**: The Experiment 3 DTLS labels were tried but may have been before DTLS was fully established. Retry with labels:
+   - `EXTRACTOR-dtls_srtp` (20B)
+   - `EXPORTER-Channel-Binding` (32B)
+   - `EXPORTER_TURN_CHANNEL_BIND` (20B)
+   - `client finished` / `server finished` (20B)
+2. **relay_token** (per-endpoint token, different from auth_token): Try `relay_data.relay_tokens[0]` as HMAC key
+3. **SaslContinue/challenge-response**: Maybe the relay expects a 401 response with nonce, then re-derive key. Our code has `pre_ice_allocate_with_subscriptions()` in `ice_interceptor.rs` with 401 handling
+4. **SCTP association key**: Investigate SCTP-layer keying material
+5. **Capture desktop traffic**: Run desktop client with packet capture to see exact bytes
+
+### Step 3: Alternative Subscription Registration (if STUN fails)
+1. **No explicit subscription**: Maybe the relay auto-detects streams from RTP packets (since `disable_ssrc_subscription=true`)
+2. **Just send audio**: Skip all STUN probing, immediately send SRTP packets via DataChannel. The relay may forward them based on the DataChannel association alone.
+3. **Raw protobuf on DC with framing**: The raw protobuf subs sent on DC might need a specific header/framing byte
+
+### Step 4: Connection Timeout Fix
+The WebRTC connection drops during STUN probing (~20s). Reduce timeout per probe to 500ms and limit total probing to 5s. Or skip probing entirely and just send audio.
+
+---
+
+## Desktop Reference (WORKING Implementation)
+
+### File: `whatsapp-ui/src/audio/call_media_pipeline.rs`
+
+The desktop client's working audio pipeline does:
+
+1. **STUN Allocate via DataChannel** (lines 100-208):
+   ```rust
+   StunMessage::allocate_request(transaction_id)
+       .with_username(auth_token)           // base64-decoded, ~70B
+       .with_integrity_key(relay_key)       // base64-decoded, 16B
+       .with_sender_subscriptions(subs)     // audio-only, ~12B
+   ```
+
+2. **Credential extraction** (`whatsapp-ui/src/client/whatsapp.rs:58-83`):
+   ```rust
+   let auth = engine.decode(&relay_info.auth_token).unwrap_or_else(|_| ...);
+   let key = engine.decode(&relay_info.relay_key).unwrap_or_else(|_| ...);
+   ```
+
+3. **Audio pipeline** (lines 226-400):
+   - SSRC generated randomly, used in BOTH SenderSubscriptions and RTP packets
+   - Opus codec, payload type 120
+   - SRTP with hbh_key (symmetric key for both send/receive)
+   - Send: Opus → RTP → SRTP → DataChannel
+   - Receive: DataChannel → SRTP → RTP → Opus
+
+### Key Differences from Our Bot Code
+
+| Aspect | Desktop (WORKING) | Bot (NOT WORKING) |
+|--------|-------------------|-------------------|
+| SenderSubs format | audio-only, ~12B, no JID | combined audio+app-data, ~67B, with JID |
+| Credential format | base64-decoded raw bytes | base64 string bytes (decoded in allocate fn) |
+| STUN attributes | USERNAME + subs + INTEGRITY + FINGERPRINT + PRIORITY | Varies by experiment |
+| RTP payload type | 120 | 111 |
+| Subscription count | 1 (audio only) | 2 (audio + app-data) |
 
 ---
 
 ## Server Configuration Reference
 
-### Environment File: `/etc/default/whatsapp-call-bot`
+### Environment File: `/etc/default/whatsapp-call-bot` (CURRENT)
 
 ```bash
-# Call automation
-WHATSAPP_CALL_AUTOMATION_ENABLED=true
-WHATSAPP_CALL_AUTO_ACCEPT=true
-WHATSAPP_TEST_CALL_TO=+919620515656
-WHATSAPP_TEST_CALL_DELAY_SECS=2
-
-# Signaling
-WHATSAPP_CALL_DEFER_OUTGOING_SETUP=true
-WHATSAPP_CALL_CREATOR_MODE=manager
-WHATSAPP_CALL_PREFER_LID=true
-WHATSAPP_CALL_OFFER_DEVICE_IDENTITY=true
-WHATSAPP_CALL_OFFER_NET_MEDIUM=1
-
-# Media
-WHATSAPP_CALL_SAMPLE_AUDIO=true
-WHATSAPP_CALL_SAMPLE_AUDIO_DURATION_MS=30000
-WHATSAPP_CALL_SAMPLE_AUDIO_FREQ_HZ=440
-WHATSAPP_CALL_RTP_PAYLOAD_TYPE=111
-
-# Transport
-WHATSAPP_CALL_DC_NEGOTIATED_STREAM0=true
-WHATSAPP_CALL_RAW_MEDIA=true
-WHATSAPP_CALL_PRE_ICE_BIND=false
-WHATSAPP_CALL_STUN_ALLOCATE=true  # Should be false for Phase 6
-
-# STUN/Subscription
+WHATSAPP_CALL_AUDIO_TRANSCEIVER=false
+WHATSAPP_CALL_AUDIO_TRACK_SEND=false
+WHATSAPP_CALL_DC_MEDIA=true
+WHATSAPP_CALL_RAW_MEDIA=false
+WHATSAPP_CALL_STUN_ALLOCATE=true
+WHATSAPP_CALL_DTLS_ALLOCATE=false
+WHATSAPP_CALL_DC_PROTO_SUBS=true
+WHATSAPP_CALL_RAW_KEEPALIVE=true
+WHATSAPP_CALL_SUB_KEEPALIVE=true
+WHATSAPP_CALL_PRE_ICE_BIND=true
+WHATSAPP_CALL_PRE_ICE_ALLOCATE=true
 WHATSAPP_CALL_STUN_BIND_SUBS=false
-WHATSAPP_CALL_BIND_RAW_UDP=true
-WHATSAPP_CALL_BIND_BOTH_SUBS=true
-
-# Diagnostics
-RUST_LOG=info,webrtc_sctp=warn,webrtc_ice=warn,webrtc_dtls=warn,webrtc=info
-WHATSAPP_CALL_SRTP_OFFSET_SCAN=true
-WHATSAPP_CALL_PACKET_DEBUG_COUNT=100
+WHATSAPP_CALL_KEEPALIVE_MS=2000
+WHATSAPP_CALL_STUN_SENDER_SUBS=false
+WHATSAPP_CALL_DC_NEGOTIATED_STREAM0=true
+WHATSAPP_TEST_CALL_TO=+919620515656
+WHATSAPP_TEST_CALL_DELAY_SECS=5
+WHATSAPP_CALL_SAMPLE_AUDIO_DURATION_MS=30000
+WHATSAPP_VOICE_PING_INTERVAL_SECS=5
+WHATSAPP_CALL_PREFER_LID=true
+WHATSAPP_CALL_OFFER_SEND_NOTICE=true
+WHATSAPP_CALL_OFFER_NET_MEDIUM=1
+WHATSAPP_CALL_OFFER_DUAL_AUDIO=false
+WHATSAPP_CALL_OFFER_CAPABILITY=false
 ```
 
 ### Useful Commands
@@ -383,11 +547,19 @@ journalctl -u whatsapp-call-bot --no-pager | grep -E "offer ACK|preaccept|WebRTC
 - SRTP encryption/packet creation
 - Opus sample audio generation
 - DC STUN message exchange (can send/receive Allocate with errors)
+- DC STUN parser accepts: USERNAME, FINGERPRINT, PRIORITY, MESSAGE-INTEGRITY individually
+- Offer config with LID target, notice=true, net=1 gets relay data
 
 ### Not Working
 - **Audio streaming in either direction**
-- STUN Bind on shared WebRTC socket (no response)
-- STUN Allocate on DataChannel (can't authenticate - wrong HMAC key)
-- Subscription registration (relay ignores raw protobuf on DC, rejects 0x4000/0x4001 in STUN)
-- Phone stays in "Reconnecting" state
-- Remote terminates call after ~20 seconds
+- STUN Bind on raw UDP socket (no response, all strategies timeout)
+- STUN Allocate on DataChannel: **two separate problems**:
+  1. **SenderSubscriptions (0x4000) format**: Our combined protobuf (67B) causes 456 parse error. Desktop uses audio-only (12B). **FIX KNOWN - not yet applied.**
+  2. **HMAC key unknown**: 15+ key candidates (direct + derived + DTLS-exported) all produce 450. **No fix known.**
+- Subscription registration not working (relay ignores raw protobuf on DC)
+- Phone shows "Reconnecting" state (no audio)
+- Call disconnects after ~20s (no keepalive from our side reaches phone)
+
+### Two Remaining Blockers (in order)
+1. **Fix SenderSubscriptions format** → change `create_combined_sender_subscriptions()` to `create_audio_sender_subscriptions(ssrc)` (should change 456→450)
+2. **Find correct HMAC key** → most likely DTLS-derived or relay_token-based

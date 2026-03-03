@@ -45,6 +45,12 @@ use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
+use webrtc::media;
+use webrtc::rtp_transceiver::rtp_codec::{RTCRtpCodecCapability, RTCRtpCodecParameters, RTPCodecType};
+use webrtc::rtp_transceiver::RTCRtpTransceiverInit;
+use webrtc::rtp_transceiver::rtp_transceiver_direction::RTCRtpTransceiverDirection;
+use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
+use webrtc::track::track_local::TrackLocal;
 
 use super::ice_interceptor::RelayUdpConn;
 use crate::calls::{RelayData, WHATSAPP_RELAY_PORT};
@@ -157,6 +163,11 @@ pub struct WebRtcTransport {
     /// Interceptor channel: receives copies of incoming STUN + RTP/SRTP packets
     /// from the shared UDP socket (bypassing the WebRTC mux).
     interceptor_rx: Mutex<Option<tokio::sync::mpsc::Receiver<Vec<u8>>>>,
+    /// Audio track for sending audio through WebRTC's native RTP path.
+    /// When set, audio goes through DTLS-SRTP (negotiated with relay) instead of manual SRTP.
+    audio_track: Mutex<Option<Arc<TrackLocalStaticSample>>>,
+    /// Channel for receiving incoming audio RTP packets from the remote peer.
+    audio_rx: Mutex<Option<mpsc::Receiver<Vec<u8>>>>,
 }
 
 impl WebRtcTransport {
@@ -173,6 +184,8 @@ impl WebRtcTransport {
             relay_socket: Mutex::new(None),
             relay_addr: Mutex::new(None),
             interceptor_rx: Mutex::new(None),
+            audio_track: Mutex::new(None),
+            audio_rx: Mutex::new(None),
         }
     }
 
@@ -338,7 +351,7 @@ impl WebRtcTransport {
             let (result, _index, rest) = select_all(remaining).await;
 
             match result {
-                Ok(Ok((relay_info, peer_connection, data_channel, tx, rx, shared_sock, shared_addr, int_rx))) => {
+                Ok(Ok((relay_info, peer_connection, data_channel, tx, rx, shared_sock, shared_addr, int_rx, a_track, a_rx))) => {
                     // Store the successful connection
                     *self.peer_connection.lock().await = Some(peer_connection.clone());
                     *self.data_channel.lock().await = Some(data_channel);
@@ -350,6 +363,8 @@ impl WebRtcTransport {
                     *self.relay_socket.lock().await = Some(shared_sock);
                     *self.relay_addr.lock().await = Some(shared_addr);
                     *self.interceptor_rx.lock().await = Some(int_rx);
+                    *self.audio_track.lock().await = a_track;
+                    *self.audio_rx.lock().await = Some(a_rx);
                     *self.state.write().await = WebRtcState::Connected;
 
                     // Abort remaining connection attempts
@@ -408,7 +423,7 @@ impl WebRtcTransport {
             let (result, _index, rest) = select_all(remaining).await;
 
             match result {
-                Ok(Ok((relay_info, peer_connection, data_channel, tx, rx, shared_sock, shared_addr, int_rx))) => {
+                Ok(Ok((relay_info, peer_connection, data_channel, tx, rx, shared_sock, shared_addr, int_rx, a_track, a_rx))) => {
                     // Store the successful connection
                     *self.peer_connection.lock().await = Some(peer_connection.clone());
                     *self.data_channel.lock().await = Some(data_channel);
@@ -420,6 +435,8 @@ impl WebRtcTransport {
                     *self.relay_socket.lock().await = Some(shared_sock);
                     *self.relay_addr.lock().await = Some(shared_addr);
                     *self.interceptor_rx.lock().await = Some(int_rx);
+                    *self.audio_track.lock().await = a_track;
+                    *self.audio_rx.lock().await = Some(a_rx);
                     *self.state.write().await = WebRtcState::Connected;
 
                     // Abort remaining connection attempts
@@ -449,6 +466,7 @@ impl WebRtcTransport {
 
     /// Try to connect to a single relay.
     /// This is the core connection logic extracted for parallel execution.
+    #[allow(clippy::type_complexity)]
     async fn try_connect_to_relay(
         relay_info: RelayConnectionInfo,
         timeout: Duration,
@@ -462,6 +480,8 @@ impl WebRtcTransport {
             Arc<tokio::net::UdpSocket>,
             SocketAddr,
             tokio::sync::mpsc::Receiver<Vec<u8>>,
+            Option<Arc<TrackLocalStaticSample>>,
+            mpsc::Receiver<Vec<u8>>,
         ),
         WebRtcError,
     > {
@@ -621,6 +641,97 @@ impl WebRtcTransport {
         let config = RTCConfiguration::default();
         let peer_connection = Arc::new(api.new_peer_connection(config).await?);
 
+        // Add audio transceiver so SDP includes m=audio and DTLS-SRTP is negotiated.
+        // This tells the relay we want to send/receive audio, and the relay will
+        // handle DTLS-SRTP ↔ SDES bridging to the mobile peer.
+        let add_audio = env_bool("WHATSAPP_CALL_AUDIO_TRANSCEIVER", true);
+        let audio_track = if add_audio {
+            let track = Arc::new(TrackLocalStaticSample::new(
+                RTCRtpCodecCapability {
+                    mime_type: "audio/opus".to_string(),
+                    clock_rate: 48000,
+                    channels: 2,
+                    sdp_fmtp_line: "minptime=10;useinbandfec=1".to_string(),
+                    ..Default::default()
+                },
+                "audio".to_string(),
+                "wa-audio".to_string(),
+            ));
+
+            // Add audio track to PeerConnection (creates sendrecv transceiver)
+            peer_connection
+                .add_transceiver_from_track(
+                    Arc::clone(&track) as Arc<dyn TrackLocal + Send + Sync>,
+                    Some(RTCRtpTransceiverInit {
+                        direction: RTCRtpTransceiverDirection::Sendrecv,
+                        send_encodings: Vec::new(),
+                    }),
+                )
+                .await?;
+
+            info!(
+                "Added audio transceiver for relay {} (Opus 48kHz, sendrecv)",
+                relay_info.relay_name
+            );
+            Some(track)
+        } else {
+            info!("Audio transceiver DISABLED for relay {}", relay_info.relay_name);
+            None
+        };
+
+        // Set up incoming audio track handler
+        let (audio_tx, audio_rx) = mpsc::channel::<Vec<u8>>(2048);
+        let relay_name_for_track = relay_info.relay_name.clone();
+        peer_connection.on_track(Box::new(move |track, _receiver, _transceiver| {
+            let audio_tx = audio_tx.clone();
+            let relay_name = relay_name_for_track.clone();
+            Box::pin(async move {
+                info!(
+                    "INCOMING TRACK for relay {}: kind={:?}, codec={}, ssrc={}, pt={}",
+                    relay_name,
+                    track.kind(),
+                    track.codec().capability.mime_type,
+                    track.ssrc(),
+                    track.payload_type(),
+                );
+
+                // Read RTP packets from this track and forward to audio_rx
+                let relay_name_inner = relay_name.clone();
+                tokio::spawn(async move {
+                    let mut count = 0u64;
+                    loop {
+                        match track.read_rtp().await {
+                            Ok((rtp_packet, _attributes)) => {
+                                count += 1;
+                                if count <= 5 || count % 100 == 0 {
+                                    info!(
+                                        "Incoming RTP #{} for {}: ssrc={}, pt={}, seq={}, ts={}, payload={} bytes",
+                                        count, relay_name_inner,
+                                        rtp_packet.header.ssrc,
+                                        rtp_packet.header.payload_type,
+                                        rtp_packet.header.sequence_number,
+                                        rtp_packet.header.timestamp,
+                                        rtp_packet.payload.len(),
+                                    );
+                                }
+                                // Send raw payload to audio_rx channel
+                                if audio_tx.send(rtp_packet.payload.to_vec()).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                info!(
+                                    "Track read ended for {} after {} packets: {}",
+                                    relay_name_inner, count, e
+                                );
+                                break;
+                            }
+                        }
+                    }
+                });
+            })
+        }));
+
         // Default to negotiated stream 0 (current behavior), but keep a runtime
         // fallback to non-negotiated mode for relay interoperability experiments.
         let negotiated_stream0 = env_bool("WHATSAPP_CALL_DC_NEGOTIATED_STREAM0", true);
@@ -776,15 +887,21 @@ impl WebRtcTransport {
         //   var u = xe(s, e);
         //   yield a.setRemoteDescription({sdp: u, type: "answer"});
         let original_sdp = offer.sdp.clone();
-        debug!(
-            "Original SDP for {}:\n{}",
-            relay_info.relay_name, original_sdp
+        info!(
+            "Original SDP for {} ({} chars, m-sections: {}):\n{}",
+            relay_info.relay_name,
+            original_sdp.len(),
+            original_sdp.matches("m=").count(),
+            original_sdp
         );
 
         let modified_sdp = manipulate_sdp(&original_sdp, &relay_info);
-        debug!(
-            "Modified SDP for {}:\n{}",
-            relay_info.relay_name, modified_sdp
+        info!(
+            "Modified SDP for {} ({} chars, m-sections: {}):\n{}",
+            relay_info.relay_name,
+            modified_sdp.len(),
+            modified_sdp.matches("m=").count(),
+            modified_sdp
         );
 
         // Log the exact credentials being used for STUN authentication
@@ -807,7 +924,7 @@ impl WebRtcTransport {
         tokio::select! {
             _ = open_rx => {
                 info!("DataChannel opened successfully for relay {}", relay_info.relay_name);
-                Ok((relay_info, peer_connection, data_channel, tx, rx, shared_socket, shared_relay_addr, interceptor_rx))
+                Ok((relay_info, peer_connection, data_channel, tx, rx, shared_socket, shared_relay_addr, interceptor_rx, audio_track, audio_rx))
             }
             _ = ice_failed_rx => {
                 warn!("ICE connection failed for relay {}", relay_info.relay_name);
@@ -820,6 +937,29 @@ impl WebRtcTransport {
                 Err(WebRtcError::Timeout)
             }
         }
+    }
+
+    /// Register WhatsApp-compatible audio codecs in the MediaEngine.
+    ///
+    /// WhatsApp uses Opus with PT=120 (not the WebRTC default of PT=111).
+    /// This registers Opus at PT=120 to match what the WhatsApp relay expects.
+    fn register_whatsapp_codecs(media_engine: &mut MediaEngine) -> Result<(), WebRtcError> {
+        media_engine.register_codec(
+            RTCRtpCodecParameters {
+                capability: RTCRtpCodecCapability {
+                    mime_type: "audio/opus".to_string(),
+                    clock_rate: 48000,
+                    channels: 2,
+                    sdp_fmtp_line: "minptime=10;useinbandfec=1".to_string(),
+                    ..Default::default()
+                },
+                payload_type: 120,
+                ..Default::default()
+            },
+            RTPCodecType::Audio,
+        )?;
+        info!("Registered Opus codec with PT=120 for WhatsApp compatibility");
+        Ok(())
     }
 
     /// Create the WebRTC API with appropriate settings (static version for parallel connections).
@@ -836,7 +976,8 @@ impl WebRtcTransport {
         preferred_port: Option<u16>,
     ) -> Result<webrtc::api::API, WebRtcError> {
         let mut media_engine = MediaEngine::default();
-        media_engine.register_default_codecs()?;
+        // Register Opus with PT=120 (WhatsApp's expected payload type, not default 111)
+        Self::register_whatsapp_codecs(&mut media_engine)?;
 
         let mut registry = Registry::new();
         registry = register_default_interceptors(registry, &mut media_engine)?;
@@ -871,7 +1012,8 @@ impl WebRtcTransport {
         udp_mux: Arc<UDPMuxDefault>,
     ) -> Result<webrtc::api::API, WebRtcError> {
         let mut media_engine = MediaEngine::default();
-        media_engine.register_default_codecs()?;
+        // Register Opus with PT=120 (WhatsApp's expected payload type, not default 111)
+        Self::register_whatsapp_codecs(&mut media_engine)?;
 
         let mut registry = Registry::new();
         registry = register_default_interceptors(registry, &mut media_engine)?;
@@ -1056,6 +1198,70 @@ impl WebRtcTransport {
     /// Receive an intercepted packet (STUN response or RTP/SRTP) from the shared UDP socket.
     pub async fn recv_intercepted_timeout(&self, timeout_dur: Duration) -> Result<Vec<u8>, WebRtcError> {
         let mut rx = self.interceptor_rx.lock().await;
+        let rx = rx.as_mut().ok_or(WebRtcError::NotConnected)?;
+        match tokio::time::timeout(timeout_dur, rx.recv()).await {
+            Ok(Some(data)) => Ok(data),
+            Ok(None) => Err(WebRtcError::ConnectionClosed),
+            Err(_) => Err(WebRtcError::Timeout),
+        }
+    }
+
+    /// Send an Opus audio sample through the WebRTC audio track (DTLS-SRTP path).
+    /// The WebRTC stack handles RTP framing, SRTP encryption, and UDP sending.
+    pub async fn send_audio_sample(
+        &self,
+        data: bytes::Bytes,
+        duration: Duration,
+    ) -> Result<(), WebRtcError> {
+        let track = self.audio_track.lock().await;
+        let track = track.as_ref().ok_or(WebRtcError::NotConnected)?;
+        track
+            .write_sample(&media::Sample {
+                data,
+                duration,
+                ..Default::default()
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Check if the audio track is available.
+    pub async fn has_audio_track(&self) -> bool {
+        self.audio_track.lock().await.is_some()
+    }
+
+    /// Export keying material from the DTLS connection (RFC 5705).
+    ///
+    /// This is used for TURN Allocate MESSAGE-INTEGRITY authentication.
+    /// The HMAC key for the relay's DC STUN parser is likely derived from the
+    /// DTLS session's exported keying material.
+    pub async fn export_keying_material(
+        &self,
+        label: &str,
+        context: &[u8],
+        length: usize,
+    ) -> Result<Vec<u8>, WebRtcError> {
+        use webrtc::util::KeyingMaterialExporter;
+
+        let pc = self.peer_connection.lock().await;
+        let pc = pc.as_ref().ok_or(WebRtcError::NotConnected)?;
+
+        let dtls_transport = pc.dtls_transport();
+        let conn = dtls_transport
+            .get_conn()
+            .await
+            .ok_or(WebRtcError::NotConnected)?;
+
+        let state = conn.connection_state().await;
+        state
+            .export_keying_material(label, context, length)
+            .await
+            .map_err(|e| WebRtcError::Send(format!("DTLS export_keying_material failed: {}", e)))
+    }
+
+    /// Receive incoming audio RTP payload (decoded by WebRTC stack).
+    pub async fn recv_audio_timeout(&self, timeout_dur: Duration) -> Result<Vec<u8>, WebRtcError> {
+        let mut rx = self.audio_rx.lock().await;
         let rx = rx.as_mut().ok_or(WebRtcError::NotConnected)?;
         match tokio::time::timeout(timeout_dur, rx.recv()).await {
             Ok(Some(data)) => Ok(data),
