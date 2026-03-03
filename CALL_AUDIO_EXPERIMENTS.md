@@ -388,51 +388,115 @@ let combined_subs = create_combined_sender_subscriptions(ssrc, self_pid, sender_
 
 ---
 
-## Phase 8: Next Steps (PRIORITIZED)
+## Phase 8: Audio-Only SenderSubscriptions Test (Mar 3, ~23:56 IST)
 
-### Step 1: Fix SenderSubscriptions Format (HIGH PRIORITY)
-**Hypothesis**: The 0x4000 attribute causes 456 because our protobuf is wrong (67B combined with JID) vs desktop's format (12B audio-only).
+### Hypothesis
+The 0x4000 (SenderSubscriptions) 456 error was caused by our combined protobuf (67B, audio+app-data+JID). Using the desktop's audio-only format (~12B) should make it parseable.
 
-**Action**: In `perform_stun_allocate()`, replace:
-```rust
-let combined_subs = create_combined_sender_subscriptions(ssrc, self_pid, sender_jid.clone());
+### Results
+
+**Phase 1 (Desktop-matching format)**: USERNAME + audio_subs(12B) + INTEGRITY(relay_key_raw) → **456**
+- Even with audio-only subs, the full desktop format is rejected
+
+**Phase 2a (Audio-only subs isolation)**: audio_subs(12B) + INTEGRITY only → **456**
+- The 0x4000 attribute itself is rejected regardless of protobuf content
+
+**Phase 2b (Combined subs comparison)**: combined_subs(68B) + INTEGRITY → **456** (expected)
+
+**Phase 3 (Key scan with desktop format)**: All keys with USERNAME + audio_subs → **ALL 456**
+- relay_key_raw, relay_token_raw, auth_token_raw, relay_key_b64str, hbh_key, hbh_master16, warp_auth: ALL 456
+
+**Phase 4 (DTLS export keying material)**: DTLS keys with USERNAME + audio_subs → **ALL 456**
+- EXTRACTOR-dtls_srtp (20B) → 456
+- EXPORTER-Channel-Binding (32B) → 456
+- EXPORTER_TURN_CHANNEL_BIND (20B) → 456
+- EXPORTER-DTLS (20B) → 456
+- EXPORTER-Media-Keying (30B) → 456
+- "client finished" / "server finished" → RESERVED LABEL (can't export)
+
+**Phase 5 (Minimal, no subs, no username)**: Parseable → **ALL 450**
+- relay_token_raw (182B) → 450 (new key candidate, parseable, wrong)
+- hbh_master16 (16B) → 450
+- dtls_minimal (20B) → 450
+
+### CRITICAL FINDING
+
+**The DC STUN parser COMPLETELY REJECTS attribute type 0x4000 (SenderSubscriptions).**
+- This is true regardless of protobuf content (12B audio-only vs 67B combined)
+- The parser treats 0x4000 as an unknown comprehension-required attribute (RFC 5389 Section 7.3.1)
+- The desktop reference code (`whatsapp-ui/src/audio/call_media_pipeline.rs`) uses 0x4000 but **may not actually work**
+- The real WhatsApp desktop client likely uses a different mechanism for subscription registration
+
+### Revised DC STUN Parser Capability Map
+
+| Attribute Type | Name | Parseable? | Error |
+|---------------|------|-----------|-------|
+| 0x0006 | USERNAME | **Yes** | 450 |
+| 0x0008 | MESSAGE-INTEGRITY | **Yes** | (required) |
+| 0x0019 | REQUESTED-TRANSPORT | **Yes** | (required) |
+| 0x0024 | PRIORITY | **Yes** | 450 |
+| 0x4000 | SenderSubscriptions | **NO** | **456** |
+| 0x4001 | ReceiverSubscription | **NO** | 456 |
+| 0x8028 | FINGERPRINT | **Yes** | 451/450 |
+
+### Two Independent Problems Confirmed:
+1. **0x4000 is rejected by DC STUN parser** → Cannot register subscriptions via STUN on DC
+2. **HMAC key is unknown** → Even without 0x4000, no key produces 0x0103 (Allocate Success)
+
+---
+
+## Phase 9: Next Steps (PRIORITIZED)
+
+### CRITICAL PIVOT: Skip STUN Allocate, Send Audio Directly
+
+Given that:
+1. 0x4000 (SenderSubscriptions) is **always rejected** by DC STUN parser (456)
+2. **No HMAC key works** for even basic Allocate (all 20+ keys tried → 450)
+3. The STUN Allocate path is a dead end for subscription registration
+
+**The next experiment should bypass STUN entirely and try sending SRTP audio directly on the DataChannel.**
+
+The relay already knows about our connection through ICE/DTLS/SCTP/DataChannel handshake. Since `disable_ssrc_subscription=true`, the relay may not need explicit subscription registration at all - it may forward audio based on the DataChannel association.
+
+### Step 1: Direct Audio Send (NO STUN) — HIGHEST PRIORITY
+**Config**:
 ```
-with:
-```rust
-let audio_subs = create_audio_sender_subscriptions(ssrc);
+WHATSAPP_CALL_STUN_ALLOCATE=false
+WHATSAPP_CALL_DTLS_ALLOCATE=false
+WHATSAPP_CALL_DC_MEDIA=true
+WHATSAPP_CALL_DC_PROTO_SUBS=false    # Skip raw protobuf subs too
+WHATSAPP_CALL_RAW_MEDIA=false
+WHATSAPP_CALL_PRE_ICE_BIND=false     # Skip pre-ICE (always times out)
+WHATSAPP_CALL_PRE_ICE_ALLOCATE=false
 ```
-Then test the full desktop-matching STUN Allocate:
-```rust
-StunMessage::allocate_request(txn)
-    .with_username(&auth_token_raw)
-    .with_integrity_key(&relay_key_raw)
-    .with_sender_subscriptions(audio_subs)
-    // default FINGERPRINT=true, PRIORITY=DEFAULT_ICE_PRIORITY
-```
+**Action**: Just send SRTP packets directly on DataChannel immediately after connection, with no prior STUN Allocate or subscription registration.
 
-**Expected**: 0x4000 should now produce 450 (parseable, wrong key) instead of 456.
+**What to check**:
+- Does the phone still show "Reconnecting"?
+- Does the relay forward our SRTP packets to the phone?
+- Does the relay send the phone's audio back to us?
+- RTP payload type should be 120 (WhatsApp Opus, per desktop reference, NOT 111)
 
-### Step 2: Solve the HMAC Key Problem
-If Step 1 changes 456→450, the subscription format was the issue but the HMAC key is still wrong.
+### Step 2: RTP Payload Type Fix
+Desktop uses **PT=120** for Opus. Our code uses PT=111. This may cause the relay to drop packets.
+Check `WHATSAPP_CALL_RTP_PAYLOAD_TYPE` env var and the RtpSession configuration.
 
-**Approaches to try**:
-1. **DTLS export keying material AFTER DC establishment**: The Experiment 3 DTLS labels were tried but may have been before DTLS was fully established. Retry with labels:
-   - `EXTRACTOR-dtls_srtp` (20B)
-   - `EXPORTER-Channel-Binding` (32B)
-   - `EXPORTER_TURN_CHANNEL_BIND` (20B)
-   - `client finished` / `server finished` (20B)
-2. **relay_token** (per-endpoint token, different from auth_token): Try `relay_data.relay_tokens[0]` as HMAC key
-3. **SaslContinue/challenge-response**: Maybe the relay expects a 401 response with nonce, then re-derive key. Our code has `pre_ice_allocate_with_subscriptions()` in `ice_interceptor.rs` with 401 handling
-4. **SCTP association key**: Investigate SCTP-layer keying material
-5. **Capture desktop traffic**: Run desktop client with packet capture to see exact bytes
+### Step 3: SRTP Framing
+The desktop sends SRTP packets through DataChannel. The SRTP is keyed with hbh_key (30 bytes symmetric). Make sure:
+- SRTP unprotect/protect uses the correct keying material
+- No extra framing bytes needed for DC transport
+- The SSRC matches what was in any subscription (if applicable)
 
-### Step 3: Alternative Subscription Registration (if STUN fails)
-1. **No explicit subscription**: Maybe the relay auto-detects streams from RTP packets (since `disable_ssrc_subscription=true`)
-2. **Just send audio**: Skip all STUN probing, immediately send SRTP packets via DataChannel. The relay may forward them based on the DataChannel association alone.
-3. **Raw protobuf on DC with framing**: The raw protobuf subs sent on DC might need a specific header/framing byte
+### Step 4: Receive Path
+Currently the audio receive loop may not be consuming DC messages. Ensure:
+- `recv_from_webrtc()` is called in the receive loop
+- SRTP unprotect is tried with offset 0 (no framing byte)
+- Opus decode works on received frames
 
-### Step 4: Connection Timeout Fix
-The WebRTC connection drops during STUN probing (~20s). Reduce timeout per probe to 500ms and limit total probing to 5s. Or skip probing entirely and just send audio.
+### Step 5: Alternative Subscription Mechanisms (if Step 1 fails)
+1. **STUN Binding (not Allocate)**: Try Binding Request (0x0001) without subscriptions, just to see if it gets a response
+2. **Re-examine the WASM reference**: The actual WhatsApp Web client (browser-based) handles this differently. Look at `docs/wasm-reverse-engineering.md` if it exists
+3. **Intercept desktop traffic**: Use mitmproxy or Wireshark to capture the actual desktop client's DataChannel messages during a call
 
 ---
 
@@ -560,6 +624,11 @@ journalctl -u whatsapp-call-bot --no-pager | grep -E "offer ACK|preaccept|WebRTC
 - Phone shows "Reconnecting" state (no audio)
 - Call disconnects after ~20s (no keepalive from our side reaches phone)
 
-### Two Remaining Blockers (in order)
-1. **Fix SenderSubscriptions format** → change `create_combined_sender_subscriptions()` to `create_audio_sender_subscriptions(ssrc)` (should change 456→450)
-2. **Find correct HMAC key** → most likely DTLS-derived or relay_token-based
+### Two Confirmed Dead Ends
+1. **SenderSubscriptions (0x4000) via DC STUN**: Rejected regardless of content (audio-only 12B or combined 67B)
+2. **HMAC key for DC STUN Allocate**: 20+ keys tested (direct, derived, DTLS-exported, relay_token), ALL fail with 450
+
+### Recommended Next Approach
+**Skip STUN Allocate entirely. Send SRTP audio directly on DataChannel.** The relay may auto-forward based on DataChannel association since `disable_ssrc_subscription=true`.
+
+Also fix RTP payload type: desktop uses PT=120, our code uses PT=111.

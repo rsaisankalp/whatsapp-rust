@@ -26,7 +26,7 @@ use whatsapp_rust::bot::{Bot, MessageContext};
 use whatsapp_rust::calls::media::{
     RtpSession, SRTP_AUTH_TAG_LEN, SrtpSession, StunAttribute, StunMessage, StunMessageType,
     create_app_data_sender_subscriptions, create_audio_sender_subscriptions,
-    create_audio_sender_subscriptions_with_jid,
+    create_audio_sender_subscriptions_with_jid, create_audio_receiver_subscription,
     create_combined_sender_subscriptions, create_combined_receiver_subscription,
 };
 use whatsapp_rust::calls::{
@@ -1332,11 +1332,9 @@ async fn start_media_automation_session(
         );
     }
 
-    // DTLS Keying Material: extract from DTLS session and try as HMAC key for Allocate.
-    // The relay's DC STUN parser accepts REQUESTED-TRANSPORT + MESSAGE-INTEGRITY (no USERNAME),
-    // but all previously-tried keys (relay_key, auth_token, hbh_key, warp_auth) give error 450.
-    // The correct key is likely derived from DTLS exported keying material (RFC 5705).
-    if env_bool("WHATSAPP_CALL_DTLS_ALLOCATE", true) {
+    // DTLS Keying Material: Now handled inside perform_stun_allocate Phase 4.
+    // Keeping this section for backwards compatibility with DTLS_ALLOCATE env var.
+    if env_bool("WHATSAPP_CALL_DTLS_ALLOCATE", false) {
         info!("Attempting TURN Allocate with DTLS-derived keying material for {}", call_id_string);
 
         // Try several common DTLS export labels used by WebRTC implementations
@@ -1463,31 +1461,27 @@ async fn start_media_automation_session(
     // Experimental: Send raw protobuf subscription via DataChannel
     // This sends the subscription protobuf directly as a DC message
     if env_bool("WHATSAPP_CALL_DC_PROTO_SUBS", true) {
-        let relay_options = call_manager.get_relay_data(&call_id).await;
-        let call_info = call_manager.get_call(&call_id).await;
-        let sender_jid = call_info.as_ref().map(|c| c.call_creator.to_string());
-        let self_pid = relay_options.as_ref().and_then(|r| r.self_pid);
-
-        let combined_subs = create_combined_sender_subscriptions(ssrc, self_pid, sender_jid.clone());
-        let receiver_subs = create_combined_receiver_subscription();
+        // Use audio-only subscriptions (matching desktop reference)
+        let audio_subs = create_audio_sender_subscriptions(ssrc);
+        let receiver_subs = create_audio_receiver_subscription();
 
         info!(
-            "Sending protobuf subscriptions via DataChannel for {} (sender={} bytes, receiver={} bytes, ssrc=0x{:08x})",
-            call_id_string, combined_subs.len(), receiver_subs.len(), ssrc
+            "Sending audio-only protobuf subscriptions via DataChannel for {} (sender={} bytes, receiver={} bytes, ssrc=0x{:08x})",
+            call_id_string, audio_subs.len(), receiver_subs.len(), ssrc
         );
 
         // Send sender subscriptions
-        if let Err(e) = call_manager.send_via_webrtc(&call_id, &combined_subs).await {
+        if let Err(e) = call_manager.send_via_webrtc(&call_id, &audio_subs).await {
             warn!("DC sender subscription send failed for {}: {}", call_id_string, e);
         } else {
-            info!("Sent sender subscription via DC for {} ({} bytes)", call_id_string, combined_subs.len());
+            info!("Sent audio-only sender subscription via DC for {} ({} bytes)", call_id_string, audio_subs.len());
         }
 
         // Send receiver subscriptions
         if let Err(e) = call_manager.send_via_webrtc(&call_id, &receiver_subs).await {
             warn!("DC receiver subscription send failed for {}: {}", call_id_string, e);
         } else {
-            info!("Sent receiver subscription via DC for {} ({} bytes)", call_id_string, receiver_subs.len());
+            info!("Sent audio receiver subscription via DC for {} ({} bytes)", call_id_string, receiver_subs.len());
         }
 
         // Brief wait for relay to process
@@ -1546,16 +1540,17 @@ async fn start_media_automation_session(
         // Get sender JID and PID for subscriptions
         let ka_relay_data = call_manager.get_relay_data(&call_id).await;
         let ka_call_info = call_manager.get_call(&call_id).await;
-        let ka_sender_jid = ka_call_info.as_ref().map(|c| c.call_creator.to_string());
-        let ka_self_pid = ka_relay_data.as_ref().and_then(|r| r.self_pid);
+        let _ka_sender_jid = ka_call_info.as_ref().map(|c| c.call_creator.to_string());
+        let _ka_self_pid = ka_relay_data.as_ref().and_then(|r| r.self_pid);
         let use_sub_keepalive = env_bool("WHATSAPP_CALL_SUB_KEEPALIVE", true);
 
         tokio::spawn(async move {
             let mut tick = 0u64;
 
             // Build subscription data once (reused each tick)
-            let sender_subs = create_combined_sender_subscriptions(ka_ssrc, ka_self_pid, ka_sender_jid.clone());
-            let receiver_subs = create_combined_receiver_subscription();
+            // Use audio-only subs (matching desktop reference)
+            let sender_subs = create_audio_sender_subscriptions(ka_ssrc);
+            let receiver_subs = create_audio_receiver_subscription();
 
             loop {
                 tokio::time::sleep(Duration::from_millis(ka_interval_ms)).await;
@@ -2274,18 +2269,22 @@ async fn perform_stun_allocate(
 ) -> Result<(), String> {
     let relay_options = call_manager.get_relay_data(call_id).await;
     let call_info = call_manager.get_call(call_id).await;
-    let sender_jid = call_info.as_ref().map(|c| c.call_creator.to_string());
     let self_pid = relay_options.as_ref().and_then(|r| r.self_pid);
 
-    // Build combined sender + receiver subscriptions
+    // EXPERIMENT 6: Use AUDIO-ONLY SenderSubscriptions (matching desktop reference)
+    // Desktop uses create_audio_sender_subscriptions(ssrc) → ~12 bytes, 1 entry
+    // Previously we used create_combined_sender_subscriptions() → ~67 bytes, 2 entries + JID
+    // The combined format caused error 456 (parse failure) on the DC STUN parser
+    let audio_subs = create_audio_sender_subscriptions(ssrc);
+    let receiver_subs = create_audio_receiver_subscription();
+
+    // Also build combined subs for comparison testing
+    let sender_jid = call_info.as_ref().map(|c| c.call_creator.to_string());
     let combined_subs = create_combined_sender_subscriptions(ssrc, self_pid, sender_jid.clone());
-    let receiver_subs = create_combined_receiver_subscription();
 
     info!(
-        "DC TURN Allocate for {}: ssrc=0x{:08x}, warp_auth={}, sender_subs={} B, receiver_subs={} B",
-        call_id, ssrc,
-        warp_auth.map(|k| format!("{} bytes", k.len())).unwrap_or_else(|| "NONE".to_string()),
-        combined_subs.len(), receiver_subs.len()
+        "DC TURN Allocate for {}: ssrc=0x{:08x}, audio_subs={} B, combined_subs={} B, receiver_subs={} B",
+        call_id, ssrc, audio_subs.len(), combined_subs.len(), receiver_subs.len()
     );
 
     // Helper: send a STUN message via DC and wait for a matching response
@@ -2345,12 +2344,13 @@ async fn perform_stun_allocate(
         }
     };
 
-    // DC STUN Parser facts (from experiments 2025-03-02):
+    // DC STUN Parser facts (from experiments):
     // - Error 450 = parsed OK, wrong HMAC key
     // - Error 451 = parsed OK, needs auth
-    // - Error 456 = parser failure (unknown attribute)
-    //
-    // Experiment log: memory/audio-streaming-experiments.md
+    // - Error 456 = parser failure (unknown attribute or bad protobuf)
+    // - USERNAME, FINGERPRINT, PRIORITY: individually parseable (450)
+    // - SenderSubscriptions (0x4000) with combined format (67B): causes 456
+    // - HYPOTHESIS: audio-only subs (~12B) will be parseable (450 not 456)
 
     let mut allocate_success = false;
     let engine = base64::engine::general_purpose::STANDARD;
@@ -2358,7 +2358,7 @@ async fn perform_stun_allocate(
     // Decode credentials from base64 to raw bytes (matching desktop reference)
     let relay_key_raw = engine.decode(relay_key).unwrap_or_default();
     let auth_token_raw = engine.decode(auth_token).unwrap_or_default();
-    let hbh_key = relay_options.as_ref().and_then(|r| r.hbh_key.as_ref());
+    let hbh_key = relay_options.as_ref().and_then(|r| r.hbh_key.as_ref()).cloned();
 
     // Get relay_token (different from auth_token! per-endpoint token)
     let relay_token_raw = relay_options
@@ -2368,113 +2368,154 @@ async fn perform_stun_allocate(
         .unwrap_or_default();
 
     info!(
-        "DC Allocate credentials: relay_key_raw={} B, auth_token_raw={} B, relay_key_b64={} B, auth_token_b64={} B, relay_token={} B, hbh_key={} B",
+        "DC Allocate credentials: relay_key_raw={} B, auth_token_raw={} B, relay_token={} B, hbh_key={} B, audio_subs={} B",
         relay_key_raw.len(), auth_token_raw.len(),
-        relay_key.len(), auth_token.len(),
         relay_token_raw.len(),
-        hbh_key.map_or(0, |k| k.len())
+        hbh_key.as_ref().map_or(0, |k| k.len()),
+        audio_subs.len()
+    );
+    info!(
+        "  audio_subs hex: {:02x?}",
+        &audio_subs
+    );
+    info!(
+        "  combined_subs hex ({} B): {:02x?}",
+        combined_subs.len(),
+        &combined_subs
     );
 
-    // ---- Phase 1: Try WITHOUT MESSAGE-INTEGRITY (DC is DTLS-authenticated) ----
-    info!("Phase 1: Allocate WITHOUT MESSAGE-INTEGRITY (DTLS provides auth)");
+    // ======================================================================
+    // Phase 1: DESKTOP-MATCHING FORMAT
+    // Match the desktop reference EXACTLY:
+    // - USERNAME = auth_token_raw (decoded)
+    // - HMAC key = relay_key_raw (decoded)
+    // - SenderSubscriptions = audio-only (~12B)
+    // - FINGERPRINT = true (default)
+    // - PRIORITY = DEFAULT_ICE_PRIORITY (default)
+    // ======================================================================
+    info!("=== Phase 1: Desktop-matching Allocate (audio-only subs, relay_key_raw) ===");
     {
         let txn = generate_transaction_id();
         let msg = StunMessage::allocate_request(txn)
-            .with_fingerprint(false)
-            .with_priority(None);
+            .with_username(&auth_token_raw)
+            .with_integrity_key(&relay_key_raw)
+            .with_sender_subscriptions(audio_subs.clone());
+        // Default: FINGERPRINT=true, PRIORITY=DEFAULT_ICE_PRIORITY
         let msg_data = msg.encode();
-        info!("  NoAuth Allocate: {} B", msg_data.len());
+        info!("  Desktop-match: {} B, username={} B, key={} B, subs={} B",
+            msg_data.len(), auth_token_raw.len(), relay_key_raw.len(), audio_subs.len());
+        info!("  Hex: {:02x?}", &msg_data);
         if let Some(stun) = dc_send_and_recv(
             call_manager.clone(), call_id.clone(), msg_data,
-            "P1-no_auth".to_string(), 2000,
+            "P1-desktop".to_string(), 2000,
         ).await {
             if matches!(stun.msg_type, StunMessageType::AllocateResponse) {
-                info!("*** ALLOCATE SUCCESS without MESSAGE-INTEGRITY ***");
+                info!("*** ALLOCATE SUCCESS with desktop-matching format! ***");
                 allocate_success = true;
             } else if stun.is_error() {
                 let (c, r) = stun.error_code().unwrap_or((0, "?"));
-                info!("  P1-no_auth → error {}='{}'", c, r);
+                info!("  P1-desktop → error {}='{}' (expected: 450=wrong key, 456=subs still wrong)", c, r);
             }
         }
     }
 
-    // ---- Phase 2: Minimal Allocate with direct + derived key candidates ----
+    // ======================================================================
+    // Phase 2: Audio-only subs format test
+    // Test if audio-only subs (0x4000) is now parseable (450 vs 456)
+    // Minimal: REQUESTED-TRANSPORT + audio_subs + MESSAGE-INTEGRITY
+    // ======================================================================
     if !allocate_success {
-        info!("Phase 2: Minimal Allocate (REQUESTED-TRANSPORT + MESSAGE-INTEGRITY only)");
+        info!("=== Phase 2: Audio-only subs isolation test ===");
 
-        // Direct keys
+        // 2a: JUST audio-only subs (no USERNAME, no FINGERPRINT, no PRIORITY)
+        {
+            let txn = generate_transaction_id();
+            let msg = StunMessage::allocate_request(txn)
+                .with_fingerprint(false)
+                .with_priority(None)
+                .with_integrity_key(&relay_key_raw)
+                .with_sender_subscriptions(audio_subs.clone());
+            let msg_data = msg.encode();
+            info!("  P2a +audio_subs({}B) only: msg {} B", audio_subs.len(), msg_data.len());
+            if let Some(stun) = dc_send_and_recv(
+                call_manager.clone(), call_id.clone(), msg_data,
+                "P2a-audio_subs".to_string(), 1000,
+            ).await {
+                let (c, r) = stun.error_code().unwrap_or((0, "?"));
+                info!("  P2a audio_subs → {}='{}' (450=parseable! 456=still wrong format)", c, r);
+                if matches!(stun.msg_type, StunMessageType::AllocateResponse) {
+                    info!("*** ALLOCATE SUCCESS with audio-only subs! ***");
+                    allocate_success = true;
+                }
+            }
+        }
+
+        // 2b: Combined subs for comparison (should still give 456)
+        if !allocate_success {
+            let txn = generate_transaction_id();
+            let msg = StunMessage::allocate_request(txn)
+                .with_fingerprint(false)
+                .with_priority(None)
+                .with_integrity_key(&relay_key_raw)
+                .with_sender_subscriptions(combined_subs.clone());
+            let msg_data = msg.encode();
+            info!("  P2b +combined_subs({}B): msg {} B", combined_subs.len(), msg_data.len());
+            if let Some(stun) = dc_send_and_recv(
+                call_manager.clone(), call_id.clone(), msg_data,
+                "P2b-combined_subs".to_string(), 1000,
+            ).await {
+                let (c, r) = stun.error_code().unwrap_or((0, "?"));
+                info!("  P2b combined_subs → {}='{}' (expected 456)", c, r);
+            }
+        }
+    }
+
+    // ======================================================================
+    // Phase 3: HMAC key scan with desktop format
+    // If Phase 1 got 450, try more key candidates with the full desktop format
+    // ======================================================================
+    if !allocate_success {
+        info!("=== Phase 3: HMAC key scan (desktop format + audio-only subs) ===");
+
         let mut keys_to_try: Vec<(&str, Vec<u8>)> = vec![
-            ("relay_key_raw", relay_key_raw.clone()),          // decoded relay_key (~16B)
-            ("auth_token_raw", auth_token_raw.clone()),        // decoded auth_token (~72B)
-            ("relay_key_b64str", relay_key.to_vec()),          // base64 string bytes (24B)
+            ("relay_key_raw", relay_key_raw.clone()),
+            ("relay_token_raw", relay_token_raw.clone()),
+            ("auth_token_raw", auth_token_raw.clone()),
+            ("relay_key_b64str", relay_key.to_vec()),
         ];
-        if let Some(hbh) = hbh_key {
+        if let Some(ref hbh) = hbh_key {
             keys_to_try.push(("hbh_key", hbh.to_vec()));
+            // First 16 bytes of hbh_key (master key portion)
+            if hbh.len() >= 16 {
+                keys_to_try.push(("hbh_master16", hbh[..16].to_vec()));
+            }
         }
         if let Some(wa) = warp_auth {
             keys_to_try.push(("warp_auth", wa.to_vec()));
         }
 
-        // Derived keys
-        {
-            use hmac::Mac;
-            // HMAC-SHA1(relay_key_raw, auth_token_raw) — relay_key is the HMAC key, auth_token is the message
-            if let Ok(mut mac) = hmac::Hmac::<sha1::Sha1>::new_from_slice(&relay_key_raw) {
-                mac.update(&auth_token_raw);
-                keys_to_try.push(("hmac_sha1(rk,at)", mac.finalize().into_bytes().to_vec()));
-            }
-            // HMAC-SHA1(auth_token_raw, relay_key_raw) — reversed
-            if let Ok(mut mac) = hmac::Hmac::<sha1::Sha1>::new_from_slice(&auth_token_raw) {
-                mac.update(&relay_key_raw);
-                keys_to_try.push(("hmac_sha1(at,rk)", mac.finalize().into_bytes().to_vec()));
-            }
-            // SHA1(relay_key_raw) — simple hash
-            {
-                use sha1::Digest;
-                let hash = sha1::Sha1::digest(&relay_key_raw);
-                keys_to_try.push(("sha1(rk)", hash.to_vec()));
-            }
-            // MD5(auth_token_raw + ":" + relay_key_raw) — TURN long-term style but without realm
-            {
-                let mut ctx = md5::Context::new();
-                ctx.consume(&auth_token_raw);
-                ctx.consume(b":");
-                ctx.consume(&relay_key_raw);
-                keys_to_try.push(("md5(at:rk)", ctx.compute().to_vec()));
-            }
-            // HKDF-SHA256(relay_key_raw, "stun") — custom HKDF derivation
-            {
-                let hk = hkdf::Hkdf::<sha2::Sha256>::new(None, &relay_key_raw);
-                let mut okm = [0u8; 20];
-                if hk.expand(b"stun", &mut okm).is_ok() {
-                    keys_to_try.push(("hkdf(rk,'stun')", okm.to_vec()));
-                }
-            }
-        }
-
         // Log all key candidates
         info!("  Key candidates ({}):", keys_to_try.len());
         for (name, data) in &keys_to_try {
-            info!("    {} = {} B, first4={:02x?}", name, data.len(),
-                &data[..std::cmp::min(4, data.len())]);
+            if !data.is_empty() {
+                info!("    {} = {} B, first4={:02x?}", name, data.len(),
+                    &data[..std::cmp::min(4, data.len())]);
+            }
         }
 
         for (key_name, key_data) in &keys_to_try {
             if allocate_success { break; }
             if key_data.is_empty() { continue; }
             let txn = generate_transaction_id();
+            // Use desktop format: USERNAME + subs + INTEGRITY (default FINGERPRINT + PRIORITY)
             let msg = StunMessage::allocate_request(txn)
-                .with_fingerprint(false)
-                .with_priority(None)
-                .with_integrity_key(key_data);
+                .with_username(&auth_token_raw)
+                .with_integrity_key(key_data)
+                .with_sender_subscriptions(audio_subs.clone());
             let msg_data = msg.encode();
-            // Hex dump the first message for debugging
-            if key_name == &"relay_key_raw" {
-                info!("  P2 STUN hex ({} B): {:02x?}", msg_data.len(), &msg_data);
-            }
             if let Some(stun) = dc_send_and_recv(
                 call_manager.clone(), call_id.clone(), msg_data,
-                format!("P2-{}", key_name), 1500,
+                format!("P3-{}", key_name), 1000,
             ).await {
                 if matches!(stun.msg_type, StunMessageType::AllocateResponse) {
                     info!("*** ALLOCATE SUCCESS with key={} ***", key_name);
@@ -2487,178 +2528,106 @@ async fn perform_stun_allocate(
         }
     }
 
-    // ---- Phase 3: Attribute isolation (find which attrs cause 456 parse error) ----
-    // Phase 2 (REQUESTED-TRANSPORT + MESSAGE-INTEGRITY) → 450 (parseable)
-    // Full desktop (+ USERNAME + SenderSubs + PRIORITY + FINGERPRINT) → 456 (parse failure)
-    // Test each attribute individually to find the culprit
+    // ======================================================================
+    // Phase 4: DTLS export keying material as HMAC key
+    // The DC is established by now, so DTLS keys should be available
+    // ======================================================================
     if !allocate_success {
-        info!("Phase 3: Attribute isolation (testing which attrs cause 456)");
-        let test_key = &relay_key_raw; // Use relay_key_raw for all isolation tests
-
-        // 3a: Add JUST USERNAME
-        {
-            let txn = generate_transaction_id();
-            let msg = StunMessage::allocate_request(txn)
-                .with_fingerprint(false)
-                .with_priority(None)
-                .with_username(&auth_token_raw)
-                .with_integrity_key(test_key);
-            let msg_data = msg.encode();
-            info!("  P3a +USERNAME ({} B user): msg {} B", auth_token_raw.len(), msg_data.len());
-            if let Some(stun) = dc_send_and_recv(
-                call_manager.clone(), call_id.clone(), msg_data,
-                "P3a-username".to_string(), 1500,
-            ).await {
-                let (c, r) = stun.error_code().unwrap_or((0, "?"));
-                info!("  P3a-username → {} {}='{}'",
-                    if matches!(stun.msg_type, StunMessageType::AllocateResponse) { "SUCCESS" } else { "error" },
-                    c, r);
-                if matches!(stun.msg_type, StunMessageType::AllocateResponse) {
-                    info!("*** USERNAME was the missing piece! ***");
-                    allocate_success = true;
-                }
-            }
-        }
-
-        // 3b: Add JUST FINGERPRINT
-        if !allocate_success {
-            let txn = generate_transaction_id();
-            let msg = StunMessage::allocate_request(txn)
-                .with_fingerprint(true)
-                .with_priority(None)
-                .with_integrity_key(test_key);
-            let msg_data = msg.encode();
-            info!("  P3b +FINGERPRINT: msg {} B", msg_data.len());
-            if let Some(stun) = dc_send_and_recv(
-                call_manager.clone(), call_id.clone(), msg_data,
-                "P3b-fingerprint".to_string(), 1500,
-            ).await {
-                let (c, r) = stun.error_code().unwrap_or((0, "?"));
-                info!("  P3b-fingerprint → {}='{}'", c, r);
-            }
-        }
-
-        // 3c: Add JUST PRIORITY
-        if !allocate_success {
-            let txn = generate_transaction_id();
-            let msg = StunMessage::allocate_request(txn)
-                .with_fingerprint(false)
-                .with_priority(Some(16_777_215))
-                .with_integrity_key(test_key);
-            let msg_data = msg.encode();
-            info!("  P3c +PRIORITY: msg {} B", msg_data.len());
-            if let Some(stun) = dc_send_and_recv(
-                call_manager.clone(), call_id.clone(), msg_data,
-                "P3c-priority".to_string(), 1500,
-            ).await {
-                let (c, r) = stun.error_code().unwrap_or((0, "?"));
-                info!("  P3c-priority → {}='{}'", c, r);
-            }
-        }
-
-        // 3d: Add JUST SenderSubscriptions (0x4000)
-        if !allocate_success {
-            let txn = generate_transaction_id();
-            let msg = StunMessage::allocate_request(txn)
-                .with_fingerprint(false)
-                .with_priority(None)
-                .with_integrity_key(test_key)
-                .with_sender_subscriptions(combined_subs.clone());
-            let msg_data = msg.encode();
-            info!("  P3d +SenderSubs ({} B): msg {} B", combined_subs.len(), msg_data.len());
-            if let Some(stun) = dc_send_and_recv(
-                call_manager.clone(), call_id.clone(), msg_data,
-                "P3d-sendersubs".to_string(), 1500,
-            ).await {
-                let (c, r) = stun.error_code().unwrap_or((0, "?"));
-                info!("  P3d-sendersubs → {}='{}'", c, r);
-            }
-        }
-
-        // 3e: USERNAME + SenderSubs (no PRIORITY, no FINGERPRINT) — the two critical ones
-        if !allocate_success {
-            let txn = generate_transaction_id();
-            let msg = StunMessage::allocate_request(txn)
-                .with_fingerprint(false)
-                .with_priority(None)
-                .with_username(&auth_token_raw)
-                .with_integrity_key(test_key)
-                .with_sender_subscriptions(combined_subs.clone());
-            let msg_data = msg.encode();
-            info!("  P3e +USERNAME+SenderSubs: msg {} B", msg_data.len());
-            if let Some(stun) = dc_send_and_recv(
-                call_manager.clone(), call_id.clone(), msg_data,
-                "P3e-user+subs".to_string(), 1500,
-            ).await {
-                let (c, r) = stun.error_code().unwrap_or((0, "?"));
-                info!("  P3e-user+subs → {}='{}'", c, r);
-            }
-        }
-    }
-
-    // ---- Phase 4: If USERNAME causes 456, try different USERNAME formats ----
-    // Maybe the relay expects a shorter username or different encoding
-    if !allocate_success {
-        info!("Phase 4: USERNAME format variations");
-        let test_key = &relay_key_raw;
-        let usernames: Vec<(&str, Vec<u8>)> = vec![
-            ("auth_token_b64str", auth_token.to_vec()),      // base64 string (96 B)
-            ("relay_key_raw_as_user", relay_key_raw.clone()), // relay_key as USERNAME
-            ("relay_key_b64_as_user", relay_key.to_vec()),    // relay_key b64 as USERNAME
-            ("auth_first20", auth_token_raw[..std::cmp::min(20, auth_token_raw.len())].to_vec()),
+        info!("=== Phase 4: DTLS export keying material as HMAC key ===");
+        let dtls_labels = [
+            ("EXTRACTOR-dtls_srtp", 20usize),
+            ("EXPORTER-Channel-Binding", 32),
+            ("EXPORTER_TURN_CHANNEL_BIND", 20),
+            ("client finished", 20),
+            ("server finished", 20),
+            ("EXPORTER-DTLS", 20),
+            ("EXPORTER-Media-Keying", 30),
         ];
-        for (uname, udata) in &usernames {
+
+        for (label, length) in &dtls_labels {
             if allocate_success { break; }
-            let txn = generate_transaction_id();
-            let msg = StunMessage::allocate_request(txn)
-                .with_fingerprint(false)
-                .with_priority(None)
-                .with_username(udata)
-                .with_integrity_key(test_key);
-            let msg_data = msg.encode();
-            if let Some(stun) = dc_send_and_recv(
-                call_manager.clone(), call_id.clone(), msg_data,
-                format!("P4-{}", uname), 1500,
-            ).await {
-                let (c, r) = stun.error_code().unwrap_or((0, "?"));
-                info!("  P4 {}({}B) → {}='{}'", uname, udata.len(), c, r);
-                if matches!(stun.msg_type, StunMessageType::AllocateResponse) {
-                    info!("*** ALLOCATE SUCCESS with username={} ***", uname);
-                    allocate_success = true;
+            match call_manager
+                .export_keying_material(call_id, label, &[], *length)
+                .await
+            {
+                Ok(key_material) => {
+                    info!(
+                        "  DTLS key '{}' ({} B): {:02x?}",
+                        label, key_material.len(),
+                        &key_material[..key_material.len().min(8)]
+                    );
+
+                    // Try with desktop format (USERNAME + audio subs + INTEGRITY)
+                    let txn = generate_transaction_id();
+                    let msg = StunMessage::allocate_request(txn)
+                        .with_username(&auth_token_raw)
+                        .with_integrity_key(&key_material)
+                        .with_sender_subscriptions(audio_subs.clone());
+                    let msg_data = msg.encode();
+                    if let Some(stun) = dc_send_and_recv(
+                        call_manager.clone(), call_id.clone(), msg_data,
+                        format!("P4-dtls-{}", label), 1000,
+                    ).await {
+                        if matches!(stun.msg_type, StunMessageType::AllocateResponse) {
+                            info!("*** ALLOCATE SUCCESS with DTLS key '{}'! ***", label);
+                            allocate_success = true;
+                        } else if stun.is_error() {
+                            let (c, r) = stun.error_code().unwrap_or((0, "?"));
+                            info!("  dtls-{} → error {}='{}'", label, c, r);
+                        }
+                    }
+                }
+                Err(e) => {
+                    info!("  DTLS key '{}' export failed: {}", label, e);
                 }
             }
         }
     }
 
-    // ---- Phase 5: Binding Request with subscriptions (no USERNAME, which may cause 456) ----
+    // ======================================================================
+    // Phase 5: Minimal Allocate (no subs, no USERNAME) with key scan
+    // Fast scan: just REQUESTED-TRANSPORT + MESSAGE-INTEGRITY
+    // This avoids any 456 issues and purely tests HMAC keys
+    // ======================================================================
     if !allocate_success {
-        info!("Phase 5: STUN Binding with subscriptions (no USERNAME)");
-        let bind_keys: Vec<(&str, Vec<u8>)> = vec![
-            ("relay_key_raw", relay_key_raw.clone()),
-            ("relay_key_b64str", relay_key.to_vec()),
+        info!("=== Phase 5: Minimal Allocate (no subs, no username) key scan ===");
+
+        // Try relay_token and hbh_master16 which haven't been tested in minimal format
+        let mut minimal_keys: Vec<(&str, Vec<u8>)> = vec![
+            ("relay_token_raw", relay_token_raw.clone()),
         ];
-        for (key_name, key_data) in &bind_keys {
+        if let Some(ref hbh) = hbh_key {
+            if hbh.len() >= 16 {
+                minimal_keys.push(("hbh_master16", hbh[..16].to_vec()));
+            }
+        }
+        // Also try DTLS-derived keys in minimal format
+        for (label, length) in [("EXTRACTOR-dtls_srtp", 20), ("client finished", 20)] {
+            if let Ok(km) = call_manager.export_keying_material(call_id, label, &[], length).await {
+                minimal_keys.push(("dtls_minimal", km));
+                break; // Only need one DTLS key for minimal test
+            }
+        }
+
+        for (key_name, key_data) in &minimal_keys {
             if allocate_success { break; }
+            if key_data.is_empty() { continue; }
             let txn = generate_transaction_id();
-            // Binding with JUST subs + integrity, NO username/priority/fingerprint
-            let msg = StunMessage::binding_request(txn)
+            let msg = StunMessage::allocate_request(txn)
                 .with_fingerprint(false)
                 .with_priority(None)
-                .with_integrity_key(key_data)
-                .with_sender_subscriptions(combined_subs.clone())
-                .with_receiver_subscription(receiver_subs.clone());
+                .with_integrity_key(key_data);
             let msg_data = msg.encode();
-            info!("  P5a bind key={}: msg {} B", key_name, msg_data.len());
             if let Some(stun) = dc_send_and_recv(
                 call_manager.clone(), call_id.clone(), msg_data,
-                format!("P5a-{}", key_name), 1500,
+                format!("P5-{}", key_name), 800,
             ).await {
-                if matches!(stun.msg_type, StunMessageType::BindingResponse) {
-                    info!("*** BINDING SUCCESS with key={} ***", key_name);
+                if matches!(stun.msg_type, StunMessageType::AllocateResponse) {
+                    info!("*** ALLOCATE SUCCESS with minimal key={} ***", key_name);
                     allocate_success = true;
                 } else if stun.is_error() {
                     let (c, r) = stun.error_code().unwrap_or((0, "?"));
-                    info!("  P5a {} → {}='{}'", key_name, c, r);
+                    info!("  minimal {} → error {}='{}'", key_name, c, r);
                 }
             }
         }
@@ -2668,17 +2637,18 @@ async fn perform_stun_allocate(
         info!("*** DC STUN registration SUCCEEDED for {} ***", call_id);
     } else {
         warn!(
-            "DC STUN registration: ALL phases failed for {}. Relying on pre-ICE bind / keepalive for subs.",
+            "DC STUN registration: ALL phases failed for {}. Sending raw protobuf subs as fallback.",
             call_id
         );
     }
 
     // Always send raw protobuf subscriptions on DC as fallback
-    let _ = call_manager.send_via_webrtc(call_id, &combined_subs).await;
+    // Send audio-only subs (not combined, matching desktop format)
+    let _ = call_manager.send_via_webrtc(call_id, &audio_subs).await;
     let _ = call_manager.send_via_webrtc(call_id, &receiver_subs).await;
     info!(
-        "Sent protobuf subscriptions on DC (sender={} B, receiver={} B)",
-        combined_subs.len(), receiver_subs.len()
+        "Sent protobuf subscriptions on DC (audio_sender={} B, receiver={} B)",
+        audio_subs.len(), receiver_subs.len()
     );
     Ok(())
 }
